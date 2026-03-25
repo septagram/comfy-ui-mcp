@@ -4,6 +4,24 @@ use serde_json::Value;
 use std::time::Duration;
 use tracing::{debug, info};
 
+/// Known model folders that are safe to query.
+const MODEL_FOLDERS: &[&str] = &[
+    "checkpoints",
+    "loras",
+    "unet_gguf",
+    "diffusion_models",
+    "vae",
+    "text_encoders",
+    "clip",
+    "clip_gguf",
+    "controlnet",
+    "embeddings",
+    "upscale_models",
+];
+
+/// Folders allowed as the prefix in a model specifier for generate_image.
+const ALLOWED_MODEL_FOLDERS: &[&str] = &["checkpoints", "unet_gguf", "diffusion_models"];
+
 pub struct ComfyClient {
     client: Client,
     base_url: String,
@@ -17,11 +35,36 @@ impl ComfyClient {
         }
     }
 
-    /// List available checkpoint models.
+    /// List models in a specific folder.
+    pub async fn list_models_in_folder(&self, folder: &str) -> Result<Vec<String>> {
+        let url = format!("{}/models/{}", self.base_url, folder);
+        let resp = self.client.get(&url).send().await?;
+        if !resp.status().is_success() {
+            return Ok(vec![]);
+        }
+        let models: Vec<String> = resp.json().await.unwrap_or_default();
+        Ok(models)
+    }
+
+    /// List all models across known folders, prefixed with folder name.
+    pub async fn list_all_models(&self) -> Result<Vec<String>> {
+        let mut result = Vec::new();
+        for &folder in MODEL_FOLDERS {
+            match self.list_models_in_folder(folder).await {
+                Ok(models) => {
+                    for model in models {
+                        result.push(format!("{folder}/{model}"));
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+        Ok(result)
+    }
+
+    /// List available checkpoint models (convenience).
     pub async fn list_checkpoints(&self) -> Result<Vec<String>> {
-        let url = format!("{}/models/checkpoints", self.base_url);
-        let resp: Vec<String> = self.client.get(&url).send().await?.json().await?;
-        Ok(resp)
+        self.list_models_in_folder("checkpoints").await
     }
 
     /// Get system stats (GPU, VRAM, versions).
@@ -134,8 +177,38 @@ pub struct ImageOutput {
     pub type_: String,
 }
 
-/// Build a txt2img workflow from the given parameters.
-pub fn build_txt2img_workflow(
+/// Parse a model specifier like "checkpoints/model.safetensors" or just "model.ckpt".
+/// Returns (folder, filename). Validates against path traversal.
+pub fn parse_model_specifier(spec: &str) -> Result<(&str, &str)> {
+    // Reject path traversal
+    if spec.contains("..") || spec.contains('\\') {
+        bail!("Invalid model specifier: path traversal not allowed");
+    }
+
+    match spec.split_once('/') {
+        Some((folder, filename)) => {
+            // Validate folder is in whitelist
+            if !ALLOWED_MODEL_FOLDERS.contains(&folder) {
+                bail!(
+                    "Unknown model folder '{folder}'. Allowed: {}",
+                    ALLOWED_MODEL_FOLDERS.join(", ")
+                );
+            }
+            // Validate filename has no further slashes
+            if filename.contains('/') {
+                bail!("Invalid model specifier: nested paths not allowed");
+            }
+            Ok((folder, filename))
+        }
+        None => {
+            // No prefix — assume checkpoints
+            Ok(("checkpoints", spec))
+        }
+    }
+}
+
+/// Build a txt2img workflow for SD1.5/SDXL checkpoints.
+pub fn build_checkpoint_workflow(
     checkpoint: &str,
     prompt: &str,
     negative_prompt: &str,
@@ -145,26 +218,13 @@ pub fn build_txt2img_workflow(
     cfg: f64,
     sampler: &str,
     seed: i64,
+    lora: Option<&LoraSpec>,
 ) -> Value {
-    serde_json::json!({
+    let mut workflow = serde_json::json!({
         "1": {
             "class_type": "CheckpointLoaderSimple",
             "inputs": {
                 "ckpt_name": checkpoint
-            }
-        },
-        "2": {
-            "class_type": "CLIPTextEncode",
-            "inputs": {
-                "text": prompt,
-                "clip": ["1", 1]
-            }
-        },
-        "3": {
-            "class_type": "CLIPTextEncode",
-            "inputs": {
-                "text": negative_prompt,
-                "clip": ["1", 1]
             }
         },
         "4": {
@@ -173,21 +233,6 @@ pub fn build_txt2img_workflow(
                 "width": width,
                 "height": height,
                 "batch_size": 1
-            }
-        },
-        "5": {
-            "class_type": "KSampler",
-            "inputs": {
-                "model": ["1", 0],
-                "positive": ["2", 0],
-                "negative": ["3", 0],
-                "latent_image": ["4", 0],
-                "seed": seed,
-                "steps": steps,
-                "cfg": cfg,
-                "sampler_name": sampler,
-                "scheduler": "normal",
-                "denoise": 1.0
             }
         },
         "6": {
@@ -204,5 +249,195 @@ pub fn build_txt2img_workflow(
                 "filename_prefix": "mcp_gen"
             }
         }
-    })
+    });
+
+    // Model/clip source node — either checkpoint directly or through LoRA
+    let (model_ref, clip_ref): (Value, Value) = match lora {
+        Some(lora) => {
+            workflow["10"] = serde_json::json!({
+                "class_type": "LoraLoader",
+                "inputs": {
+                    "model": ["1", 0],
+                    "clip": ["1", 1],
+                    "lora_name": lora.name,
+                    "strength_model": lora.strength,
+                    "strength_clip": lora.strength
+                }
+            });
+            (serde_json::json!(["10", 0]), serde_json::json!(["10", 1]))
+        }
+        None => (serde_json::json!(["1", 0]), serde_json::json!(["1", 1])),
+    };
+
+    workflow["2"] = serde_json::json!({
+        "class_type": "CLIPTextEncode",
+        "inputs": {
+            "text": prompt,
+            "clip": clip_ref
+        }
+    });
+    workflow["3"] = serde_json::json!({
+        "class_type": "CLIPTextEncode",
+        "inputs": {
+            "text": negative_prompt,
+            "clip": clip_ref
+        }
+    });
+    workflow["5"] = serde_json::json!({
+        "class_type": "KSampler",
+        "inputs": {
+            "model": model_ref,
+            "positive": ["2", 0],
+            "negative": ["3", 0],
+            "latent_image": ["4", 0],
+            "seed": seed,
+            "steps": steps,
+            "cfg": cfg,
+            "sampler_name": sampler,
+            "scheduler": "normal",
+            "denoise": 1.0
+        }
+    });
+
+    workflow
+}
+
+/// Build a FLUX txt2img workflow using UnetLoaderGGUF + DualCLIPLoader.
+pub fn build_flux_workflow(
+    unet_name: &str,
+    prompt: &str,
+    width: u32,
+    height: u32,
+    steps: u32,
+    seed: i64,
+    lora: Option<&LoraSpec>,
+) -> Value {
+    let mut workflow = serde_json::json!({
+        "1": {
+            "class_type": "UnetLoaderGGUF",
+            "inputs": {
+                "unet_name": unet_name
+            }
+        },
+        "2": {
+            "class_type": "DualCLIPLoader",
+            "inputs": {
+                "clip_name1": "clip_l.safetensors",
+                "clip_name2": "t5xxl_fp8_e4m3fn.safetensors",
+                "type": "flux"
+            }
+        },
+        "4": {
+            "class_type": "EmptySD3LatentImage",
+            "inputs": {
+                "width": width,
+                "height": height,
+                "batch_size": 1
+            }
+        },
+        "8": {
+            "class_type": "VAEDecode",
+            "inputs": {
+                "samples": ["7", 0],
+                "vae": ["1", 1]  // UnetLoaderGGUF output 1 might not have VAE
+            }
+        },
+        "9": {
+            "class_type": "SaveImage",
+            "inputs": {
+                "images": ["8", 0],
+                "filename_prefix": "mcp_flux"
+            }
+        }
+    });
+
+    // Model/clip source — optionally through LoRA
+    let (model_ref, clip_ref): (Value, Value) = match lora {
+        Some(lora) => {
+            workflow["10"] = serde_json::json!({
+                "class_type": "LoraLoader",
+                "inputs": {
+                    "model": ["1", 0],
+                    "clip": ["2", 0],
+                    "lora_name": lora.name,
+                    "strength_model": lora.strength,
+                    "strength_clip": lora.strength
+                }
+            });
+            (serde_json::json!(["10", 0]), serde_json::json!(["10", 1]))
+        }
+        None => (serde_json::json!(["1", 0]), serde_json::json!(["2", 0])),
+    };
+
+    workflow["3"] = serde_json::json!({
+        "class_type": "CLIPTextEncode",
+        "inputs": {
+            "text": prompt,
+            "clip": clip_ref
+        }
+    });
+
+    // FLUX uses the advanced sampler pipeline
+    workflow["5"] = serde_json::json!({
+        "class_type": "RandomNoise",
+        "inputs": { "noise_seed": seed }
+    });
+    workflow["6"] = serde_json::json!({
+        "class_type": "BasicGuider",
+        "inputs": {
+            "model": model_ref,
+            "conditioning": ["3", 0]
+        }
+    });
+    workflow["11"] = serde_json::json!({
+        "class_type": "BasicScheduler",
+        "inputs": {
+            "model": model_ref,
+            "scheduler": "simple",
+            "steps": steps,
+            "denoise": 1.0
+        }
+    });
+    workflow["12"] = serde_json::json!({
+        "class_type": "KSamplerSelect",
+        "inputs": { "sampler_name": "euler" }
+    });
+    workflow["7"] = serde_json::json!({
+        "class_type": "SamplerCustomAdvanced",
+        "inputs": {
+            "noise": ["5", 0],
+            "guider": ["6", 0],
+            "sampler": ["12", 0],
+            "sigmas": ["11", 0],
+            "latent_image": ["4", 0]
+        }
+    });
+
+    // FLUX GGUF loader doesn't output VAE — need a separate VAE loader
+    // For now, use the built-in VAE from the unet loader (output index 1 if available)
+    // If that fails, we may need to add a VAELoader node
+    // UnetLoaderGGUF only has 1 output (MODEL), so we need a separate approach
+    // Actually, for FLUX we should use the VAE that comes with it
+    // Let's load it via a VAELoader if available, or rely on the checkpoint's VAE
+    // For simplicity: use a separate VAE loader with the FLUX ae
+    workflow["13"] = serde_json::json!({
+        "class_type": "VAELoader",
+        "inputs": {
+            "vae_name": "ae.safetensors"
+        }
+    });
+    workflow["8"] = serde_json::json!({
+        "class_type": "VAEDecode",
+        "inputs": {
+            "samples": ["7", 0],
+            "vae": ["13", 0]
+        }
+    });
+
+    workflow
+}
+
+pub struct LoraSpec {
+    pub name: String,
+    pub strength: f64,
 }
