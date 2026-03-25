@@ -8,7 +8,8 @@ use std::time::Duration;
 use tracing::info;
 
 use crate::comfy::{
-    ComfyClient, LoraSpec, build_checkpoint_workflow, build_flux_workflow, parse_model_specifier,
+    ComfyClient, LoraSpec, build_checkpoint_workflow, build_flux_workflow, build_ip2p_workflow,
+    ip2p_defaults, is_ip2p_model, parse_model_specifier,
 };
 use crate::mcp::{CallToolResult, ContentItem, ToolDefinition};
 
@@ -17,7 +18,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "generate_image".into(),
-            description: "Generate an image using Stable Diffusion or FLUX via ComfyUI. Returns file path and optionally the image data.".into(),
+            description: "Generate or edit an image via ComfyUI. For editing, provide source_image with an IP2P model (cosxl_edit or instruct-pix2pix) and use the prompt as an edit instruction.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -71,6 +72,15 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     "seed": {
                         "type": "integer",
                         "description": "Random seed. Omit for random."
+                    },
+                    "source_image": {
+                        "type": "string",
+                        "description": "Path to a source image for editing. When provided, the prompt becomes an edit instruction (e.g. 'make it snowy', 'add a hat'). Requires an IP2P-compatible model: cosxl_edit.safetensors (best quality, 1024x1024) or instruct-pix2pix-00-22000.safetensors (fast, 512x512)."
+                    },
+                    "denoise": {
+                        "type": "number",
+                        "description": "Edit strength for source_image editing (0.0-1.0). Lower = subtler edits, higher = stronger transformation. Default 0.75. Only used with source_image.",
+                        "default": 0.75
                     },
                     "output_path": {
                         "type": "string",
@@ -139,6 +149,9 @@ struct GenerateImageArgs {
     cfg: f64,
     #[serde(default = "default_sampler")]
     sampler: String,
+    source_image: Option<String>,
+    #[serde(default = "default_denoise")]
+    denoise: f64,
     seed: Option<i64>,
     output_path: Option<String>,
     #[serde(default)]
@@ -156,6 +169,9 @@ fn default_cfg() -> f64 {
 }
 fn default_sampler() -> String {
     "euler_ancestral".into()
+}
+fn default_denoise() -> f64 {
+    0.75
 }
 
 fn is_flux_model(folder: &str, filename: &str) -> bool {
@@ -185,11 +201,31 @@ async fn handle_generate_image(client: &ComfyClient, args: &Value) -> Result<Cal
     };
 
     let is_flux = is_flux_model(&folder, &filename);
+    let is_edit = args.source_image.is_some();
+    let is_ip2p = is_ip2p_model(&filename);
+
+    // Validate: source_image requires an IP2P model
+    if is_edit && !is_ip2p {
+        bail!(
+            "source_image editing requires an InstructPix2Pix-compatible model \
+             (e.g. cosxl_edit.safetensors or instruct-pix2pix-00-22000.safetensors), \
+             but got '{filename}'"
+        );
+    }
 
     // Apply model-type-appropriate defaults
-    let width = args.width.unwrap_or(if is_flux { 1024 } else { 512 });
-    let height = args.height.unwrap_or(if is_flux { 1024 } else { 768 });
-    let steps = args.steps.unwrap_or(if is_flux { 4 } else { 30 });
+    let (def_w, def_h, def_steps, def_cfg) = if is_ip2p {
+        ip2p_defaults(&filename)
+    } else if is_flux {
+        (1024, 1024, 4, 1.0)
+    } else {
+        (512, 768, 30, 7.5)
+    };
+
+    let width = args.width.unwrap_or(def_w);
+    let height = args.height.unwrap_or(def_h);
+    let steps = args.steps.unwrap_or(def_steps);
+    let cfg = if is_ip2p { def_cfg } else { args.cfg }; // IP2P models prefer their default cfg
     let seed = args.seed.unwrap_or_else(|| rand::random::<i64>().abs());
 
     // LoRA spec
@@ -201,15 +237,34 @@ async fn handle_generate_image(client: &ComfyClient, args: &Value) -> Result<Cal
     info!(
         prompt = %args.prompt,
         model = format!("{folder}/{filename}"),
+        mode = if is_edit { "edit" } else { "generate" },
         lora = args.lora.as_deref().unwrap_or("none"),
         size = format!("{width}x{height}"),
         steps = steps,
         seed = seed,
-        "Generating image"
+        "Processing image request"
     );
 
-    // Build workflow based on model type
-    let workflow = if is_flux {
+    // Build workflow based on model type and mode
+    let workflow = if is_edit {
+        // Upload source image to ComfyUI
+        let source_path = args.source_image.as_ref().unwrap();
+        let uploaded_name = client.upload_image(source_path).await?;
+        info!(uploaded = %uploaded_name, "Source image uploaded");
+
+        build_ip2p_workflow(
+            &filename,
+            &uploaded_name,
+            &args.prompt,
+            &args.negative_prompt,
+            steps,
+            cfg,
+            &args.sampler,
+            seed,
+            args.denoise,
+            lora_spec.as_ref(),
+        )
+    } else if is_flux {
         build_flux_workflow(
             &filename,
             &args.prompt,
@@ -275,6 +330,7 @@ async fn handle_generate_image(client: &ComfyClient, args: &Value) -> Result<Cal
             "file_path": file_path_str,
             "seed": seed,
             "model": format!("{folder}/{filename}"),
+            "mode": if is_edit { "edit" } else { "generate" },
             "lora": args.lora,
             "size": format!("{width}x{height}"),
         })

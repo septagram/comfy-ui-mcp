@@ -156,6 +156,38 @@ impl ComfyClient {
         }
     }
 
+    /// Upload an image file to ComfyUI's input folder. Returns the stored filename.
+    pub async fn upload_image(&self, file_path: &str) -> Result<String> {
+        let url = format!("{}/upload/image", self.base_url);
+        let file_bytes = tokio::fs::read(file_path).await
+            .with_context(|| format!("Failed to read source image: {file_path}"))?;
+
+        let file_name = std::path::Path::new(file_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("upload.png")
+            .to_string();
+
+        let part = reqwest::multipart::Part::bytes(file_bytes)
+            .file_name(file_name)
+            .mime_str("image/png")?;
+        let form = reqwest::multipart::Form::new().part("image", part);
+
+        let resp: Value = self
+            .client
+            .post(&url)
+            .multipart(form)
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        resp["name"]
+            .as_str()
+            .map(String::from)
+            .context("No 'name' in upload response")
+    }
+
     /// Fetch the raw image bytes from ComfyUI.
     pub async fn fetch_image(&self, output: &ImageOutput) -> Result<Vec<u8>> {
         let url = format!(
@@ -440,4 +472,143 @@ pub fn build_flux_workflow(
 pub struct LoraSpec {
     pub name: String,
     pub strength: f64,
+}
+
+/// Check if a model filename is an InstructPix2Pix-compatible editing model.
+pub fn is_ip2p_model(filename: &str) -> bool {
+    let lower = filename.to_lowercase();
+    lower.contains("instruct")
+        || lower.contains("pix2pix")
+        || lower.contains("ip2p")
+        || lower.contains("cosxl_edit")
+}
+
+/// Check if an IP2P model is CosXL (SDXL-based, higher res defaults).
+fn is_cosxl_model(filename: &str) -> bool {
+    filename.to_lowercase().contains("cosxl")
+}
+
+/// Default parameters for IP2P models based on type.
+pub fn ip2p_defaults(filename: &str) -> (u32, u32, u32, f64) {
+    if is_cosxl_model(filename) {
+        (1024, 1024, 20, 5.0) // CosXL: SDXL res, fewer steps, lower cfg
+    } else {
+        (512, 512, 30, 7.5) // Original IP2P: SD 1.5 res
+    }
+}
+
+/// Build an InstructPix2Pix / CosXL Edit workflow.
+/// Note: width/height are not needed — the latent dimensions come from the source image.
+pub fn build_ip2p_workflow(
+    checkpoint: &str,
+    uploaded_image_name: &str,
+    prompt: &str,
+    negative_prompt: &str,
+    steps: u32,
+    cfg: f64,
+    sampler: &str,
+    seed: i64,
+    denoise: f64,
+    lora: Option<&LoraSpec>,
+) -> Value {
+    let mut workflow = serde_json::json!({
+        "1": {
+            "class_type": "CheckpointLoaderSimple",
+            "inputs": {
+                "ckpt_name": checkpoint
+            }
+        },
+        "20": {
+            "class_type": "LoadImage",
+            "inputs": {
+                "image": uploaded_image_name
+            }
+        },
+        "6": {
+            "class_type": "VAEDecode",
+            "inputs": {
+                "samples": ["5", 0],
+                "vae": ["1", 2]
+            }
+        },
+        "7": {
+            "class_type": "SaveImage",
+            "inputs": {
+                "images": ["6", 0],
+                "filename_prefix": "mcp_edit"
+            }
+        }
+    });
+
+    // Model/clip source — optionally through LoRA
+    let (model_ref, clip_ref, vae_ref): (Value, Value, Value) = match lora {
+        Some(lora) => {
+            workflow["10"] = serde_json::json!({
+                "class_type": "LoraLoader",
+                "inputs": {
+                    "model": ["1", 0],
+                    "clip": ["1", 1],
+                    "lora_name": lora.name,
+                    "strength_model": lora.strength,
+                    "strength_clip": lora.strength
+                }
+            });
+            (
+                serde_json::json!(["10", 0]),
+                serde_json::json!(["10", 1]),
+                serde_json::json!(["1", 2]),
+            )
+        }
+        None => (
+            serde_json::json!(["1", 0]),
+            serde_json::json!(["1", 1]),
+            serde_json::json!(["1", 2]),
+        ),
+    };
+
+    // CLIP encode the edit instruction
+    workflow["2"] = serde_json::json!({
+        "class_type": "CLIPTextEncode",
+        "inputs": {
+            "text": prompt,
+            "clip": clip_ref
+        }
+    });
+    workflow["3"] = serde_json::json!({
+        "class_type": "CLIPTextEncode",
+        "inputs": {
+            "text": negative_prompt,
+            "clip": clip_ref
+        }
+    });
+
+    // InstructPixToPixConditioning: combines text conditioning with source image
+    workflow["21"] = serde_json::json!({
+        "class_type": "InstructPixToPixConditioning",
+        "inputs": {
+            "positive": ["2", 0],
+            "negative": ["3", 0],
+            "vae": vae_ref,
+            "pixels": ["20", 0]
+        }
+    });
+
+    // KSampler with IP2P conditioning
+    workflow["5"] = serde_json::json!({
+        "class_type": "KSampler",
+        "inputs": {
+            "model": model_ref,
+            "positive": ["21", 0],
+            "negative": ["21", 1],
+            "latent_image": ["21", 2],
+            "seed": seed,
+            "steps": steps,
+            "cfg": cfg,
+            "sampler_name": sampler,
+            "scheduler": "normal",
+            "denoise": denoise
+        }
+    });
+
+    workflow
 }
