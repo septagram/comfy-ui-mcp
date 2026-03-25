@@ -87,9 +87,10 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         "description": "File path to save the image. If omitted, saves to a temp file."
                     },
                     "return_image": {
-                        "type": "boolean",
-                        "description": "If true, return base64 image data so you can see it. Default false.",
-                        "default": false
+                        "type": "string",
+                        "enum": ["none", "thumb", "full"],
+                        "description": "Whether to return image data inline. 'thumb' (recommended) returns a 256x256 JPEG preview — use this by default for quick visual checks. 'full' returns the complete image as JPEG — only use when full resolution comprehension is required (risks hitting context limits). 'none' returns only the file path. Default: 'none'.",
+                        "default": "none"
                     }
                 },
                 "required": ["prompt"]
@@ -154,8 +155,8 @@ struct GenerateImageArgs {
     denoise: f64,
     seed: Option<i64>,
     output_path: Option<String>,
-    #[serde(default)]
-    return_image: bool,
+    #[serde(default = "default_return_image")]
+    return_image: String,
 }
 
 fn default_negative() -> String {
@@ -172,6 +173,9 @@ fn default_sampler() -> String {
 }
 fn default_denoise() -> f64 {
     0.75
+}
+fn default_return_image() -> String {
+    "none".into()
 }
 
 fn is_flux_model(folder: &str, filename: &str) -> bool {
@@ -337,12 +341,29 @@ async fn handle_generate_image(client: &ComfyClient, args: &Value) -> Result<Cal
         .to_string(),
     }];
 
-    if args.return_image {
-        let b64 = BASE64.encode(&image_bytes);
-        content.push(ContentItem::Image {
-            data: b64,
-            mime_type: "image/png".into(),
-        });
+    match args.return_image.as_str() {
+        "thumb" => {
+            let img = image::load_from_memory(&image_bytes)?;
+            let thumb = img.thumbnail(256, 256);
+            let mut buf = std::io::Cursor::new(Vec::new());
+            thumb.write_to(&mut buf, image::ImageFormat::Jpeg)?;
+            let b64 = BASE64.encode(buf.into_inner());
+            content.push(ContentItem::Image {
+                data: b64,
+                mime_type: "image/jpeg".into(),
+            });
+        }
+        "full" | "true" => {
+            let img = image::load_from_memory(&image_bytes)?;
+            let mut buf = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut buf, image::ImageFormat::Jpeg)?;
+            let b64 = BASE64.encode(buf.into_inner());
+            content.push(ContentItem::Image {
+                data: b64,
+                mime_type: "image/jpeg".into(),
+            });
+        }
+        _ => {} // "none", "false", or anything else — file path only
     }
 
     Ok(CallToolResult {
