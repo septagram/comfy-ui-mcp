@@ -3,6 +3,9 @@ name = "comfy-ui-mcp"
 version = "0.1.0"
 edition = "2024"
 
+[package.metadata.wix]
+product-name = "ComfyUI MCP Server"
+
 [dependencies]
 anyhow = "1.0"
 base64 = "0.22"

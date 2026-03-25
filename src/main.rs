@@ -10,6 +10,7 @@
 
 mod comfy;
 mod mcp;
+mod setup;
 mod tools;
 
 use comfy::ComfyClient;
@@ -22,8 +23,17 @@ use std::io::Write;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::{debug, error, info};
 
+fn main() -> anyhow::Result<()> {
+    match std::env::args().nth(1).as_deref() {
+        Some("--register") => return setup::register_mcp(),
+        Some("--unregister") => return setup::unregister_mcp(),
+        _ => {}
+    }
+    serve()
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn serve() -> anyhow::Result<()> {
     // Load .env from the binary's directory or current dir
     let _ = dotenvy::dotenv();
 
