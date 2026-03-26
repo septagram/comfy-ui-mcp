@@ -1,8 +1,9 @@
-## Unreleased
+## 1.1.0
 
 - Add image editing via InstructPix2Pix / CosXL Edit (`source_image` parameter)
-- Add thumbnail option to `return_image` (`none`/`thumb`/`full`), switch inline images to JPEG
-- Add denoise strength control for image editing
+- Add `denoise` parameter to control edit strength (0.0–1.0)
+- Add thumbnail option to `return_image` (`none`/`thumb`/`full`), switch inline images to JPEG for smaller context footprint
+- Add README, MIT license, CHANGELOG, and ComfyUI setup guide
 
 ## 1.0.0
 
