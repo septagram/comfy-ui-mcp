@@ -82,9 +82,14 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         "description": "Edit strength for source_image editing (0.0-1.0). Lower = subtler edits, higher = stronger transformation. Default 0.75. Only used with source_image.",
                         "default": 0.75
                     },
+                    "count": {
+                        "type": "integer",
+                        "description": "Number of images to generate. Each gets a different seed (base seed + index). Default: 1.",
+                        "default": 1
+                    },
                     "output_path": {
                         "type": "string",
-                        "description": "File path to save the image. If omitted, saves to a temp file."
+                        "description": "File path to save the image. If omitted, saves to a temp file. When count > 1, index is appended before extension (e.g. name_01.png, name_02.png)."
                     },
                     "return_image": {
                         "type": "string",
@@ -153,6 +158,8 @@ struct GenerateImageArgs {
     source_image: Option<String>,
     #[serde(default = "default_denoise")]
     denoise: f64,
+    #[serde(default = "default_count")]
+    count: u32,
     seed: Option<i64>,
     output_path: Option<String>,
     #[serde(default = "default_return_image")]
@@ -176,6 +183,16 @@ fn default_denoise() -> f64 {
 }
 fn default_return_image() -> String {
     "none".into()
+}
+fn default_count() -> u32 {
+    1
+}
+
+fn indexed_path(base: &std::path::Path, index: usize, pad: usize) -> PathBuf {
+    let stem = base.file_stem().unwrap_or_default().to_string_lossy();
+    let ext = base.extension().unwrap_or_default().to_string_lossy();
+    let parent = base.parent().unwrap_or(std::path::Path::new("."));
+    parent.join(format!("{stem}_{:0>pad$}.{ext}", index + 1))
 }
 
 fn is_flux_model(folder: &str, filename: &str) -> bool {
@@ -249,122 +266,108 @@ async fn handle_generate_image(client: &ComfyClient, args: &Value) -> Result<Cal
         "Processing image request"
     );
 
-    // Build workflow based on model type and mode
-    let workflow = if is_edit {
-        // Upload source image to ComfyUI
-        let source_path = args.source_image.as_ref().unwrap();
-        let uploaded_name = client.upload_image(source_path).await?;
-        info!(uploaded = %uploaded_name, "Source image uploaded");
+    // Batch generation loop
+    let count = args.count.max(1);
+    let pad = if count <= 1 { 1 } else { (count as f64).log10() as usize + 1 };
 
-        build_ip2p_workflow(
-            &filename,
-            &uploaded_name,
-            &args.prompt,
-            &args.negative_prompt,
-            steps,
-            cfg,
-            &args.sampler,
-            seed,
-            args.denoise,
-            lora_spec.as_ref(),
-        )
-    } else if is_flux {
-        build_flux_workflow(
-            &filename,
-            &args.prompt,
-            width,
-            height,
-            steps,
-            seed,
-            lora_spec.as_ref(),
-        )
-    } else {
-        build_checkpoint_workflow(
-            &filename,
-            &args.prompt,
-            &args.negative_prompt,
-            width,
-            height,
-            steps,
-            args.cfg,
-            &args.sampler,
-            seed,
-            lora_spec.as_ref(),
-        )
-    };
-
-    let prompt_id = client.submit_prompt(&workflow).await?;
-    info!(prompt_id = %prompt_id, "Submitted to ComfyUI");
-
-    // Wait for completion
-    let outputs = client
-        .wait_for_completion(&prompt_id, Duration::from_secs(300))
-        .await?;
-
-    let output = outputs
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("No image output found"))?;
-
-    // Fetch image bytes
-    let image_bytes = client.fetch_image(output).await?;
-
-    // Determine output file path
-    let file_path: PathBuf = match &args.output_path {
-        Some(p) => {
-            let path = PathBuf::from(p);
-            tokio::fs::write(&path, &image_bytes).await?;
-            path
-        }
+    // Determine base path for output files
+    let base_path: PathBuf = match &args.output_path {
+        Some(p) => PathBuf::from(p),
         None => {
             let temp_dir = std::env::temp_dir().join("comfy-ui-mcp");
             tokio::fs::create_dir_all(&temp_dir).await?;
-            let filename = format!("gen_{prompt_id}.png");
-            let path = temp_dir.join(filename);
-            tokio::fs::write(&path, &image_bytes).await?;
-            path
+            let batch_id = &format!("{:08x}", rand::random::<u32>());
+            temp_dir.join(format!("gen_{batch_id}.png"))
         }
     };
 
-    let file_path_str = file_path.to_string_lossy().to_string();
-    info!(path = %file_path_str, bytes = image_bytes.len(), "Image saved");
+    let mut results_json = Vec::new();
+    let mut content = Vec::new();
 
-    // Build response
-    let mut content = vec![ContentItem::Text {
-        text: serde_json::json!({
+    for i in 0..count {
+        let iter_seed = seed.wrapping_add(i as i64);
+
+        // Rebuild workflow with this iteration's seed
+        let workflow = if is_edit {
+            let source_path = args.source_image.as_ref().unwrap();
+            let uploaded_name = client.upload_image(source_path).await?;
+            build_ip2p_workflow(
+                &filename, &uploaded_name, &args.prompt, &args.negative_prompt,
+                steps, cfg, &args.sampler, iter_seed, args.denoise, lora_spec.as_ref(),
+            )
+        } else if is_flux {
+            build_flux_workflow(
+                &filename, &args.prompt, width, height, steps, iter_seed, lora_spec.as_ref(),
+            )
+        } else {
+            build_checkpoint_workflow(
+                &filename, &args.prompt, &args.negative_prompt,
+                width, height, steps, args.cfg, &args.sampler, iter_seed, lora_spec.as_ref(),
+            )
+        };
+
+        let prompt_id = client.submit_prompt(&workflow).await?;
+        info!(prompt_id = %prompt_id, index = i + 1, count = count, "Submitted to ComfyUI");
+
+        let outputs = client
+            .wait_for_completion(&prompt_id, Duration::from_secs(300))
+            .await?;
+
+        let output = outputs
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("No image output found for image {}", i + 1))?;
+
+        let image_bytes = client.fetch_image(output).await?;
+
+        // Build indexed file path
+        let file_path = indexed_path(&base_path, i as usize, pad);
+        if let Some(parent) = file_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::write(&file_path, &image_bytes).await?;
+
+        let file_path_str = file_path.to_string_lossy().to_string();
+        info!(path = %file_path_str, index = i + 1, bytes = image_bytes.len(), "Image saved");
+
+        results_json.push(serde_json::json!({
             "file_path": file_path_str,
-            "seed": seed,
+            "seed": iter_seed,
+            "index": i + 1,
             "model": format!("{folder}/{filename}"),
             "mode": if is_edit { "edit" } else { "generate" },
             "lora": args.lora,
             "size": format!("{width}x{height}"),
-        })
-        .to_string(),
-    }];
+        }));
 
-    match args.return_image.as_str() {
-        "thumb" => {
-            let img = image::load_from_memory(&image_bytes)?;
-            let thumb = img.thumbnail(256, 256);
-            let mut buf = std::io::Cursor::new(Vec::new());
-            thumb.write_to(&mut buf, image::ImageFormat::Jpeg)?;
-            let b64 = BASE64.encode(buf.into_inner());
-            content.push(ContentItem::Image {
-                data: b64,
-                mime_type: "image/jpeg".into(),
-            });
+        // Append inline image if requested
+        match args.return_image.as_str() {
+            "thumb" => {
+                let img = image::load_from_memory(&image_bytes)?;
+                let thumb = img.thumbnail(256, 256);
+                let mut buf = std::io::Cursor::new(Vec::new());
+                thumb.write_to(&mut buf, image::ImageFormat::Jpeg)?;
+                content.push(ContentItem::Image {
+                    data: BASE64.encode(buf.into_inner()),
+                    mime_type: "image/jpeg".into(),
+                });
+            }
+            "full" | "true" => {
+                let img = image::load_from_memory(&image_bytes)?;
+                let mut buf = std::io::Cursor::new(Vec::new());
+                img.write_to(&mut buf, image::ImageFormat::Jpeg)?;
+                content.push(ContentItem::Image {
+                    data: BASE64.encode(buf.into_inner()),
+                    mime_type: "image/jpeg".into(),
+                });
+            }
+            _ => {}
         }
-        "full" | "true" => {
-            let img = image::load_from_memory(&image_bytes)?;
-            let mut buf = std::io::Cursor::new(Vec::new());
-            img.write_to(&mut buf, image::ImageFormat::Jpeg)?;
-            let b64 = BASE64.encode(buf.into_inner());
-            content.push(ContentItem::Image {
-                data: b64,
-                mime_type: "image/jpeg".into(),
-            });
-        }
-        _ => {} // "none", "false", or anything else — file path only
     }
+
+    // Prepend the metadata array as the first content item
+    content.insert(0, ContentItem::Text {
+        text: serde_json::to_string(&results_json)?,
+    });
 
     Ok(CallToolResult {
         content,
