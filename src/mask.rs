@@ -26,12 +26,13 @@ const GRID_COLOR: Rgba<u8> = Rgba([180, 180, 180, 192]);
 const LABEL_COLOR: Rgba<u8> = Rgba([230, 230, 230, 255]);
 const OVERLAY_COLOR: Rgba<u8> = Rgba([255, 0, 0, 96]);
 
-// ── 5×7 bitmap digits for '1'..'8' ──────────────────────────────────────
-// Each row is 5 bits in a u8; bit 4 = leftmost pixel, bit 0 = rightmost.
+// ── 5×7 bitmap glyphs ────────────────────────────────────────────────────
+// Digits 1-8 for row labels, letters A-H for column labels. Five bits per
+// row in a u8; bit 4 = leftmost pixel, bit 0 = rightmost.
 
 const DIGIT_W: u32 = 5;
 const DIGIT_H: u32 = 7;
-const DIGIT_SCALE: u32 = 4;
+const DIGIT_SCALE: u32 = 2;
 
 const DIGITS: [[u8; 7]; 8] = [
     // 1
@@ -50,6 +51,25 @@ const DIGITS: [[u8; 7]; 8] = [
     [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000],
     // 8
     [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
+];
+
+const LETTERS: [[u8; 7]; 8] = [
+    // A
+    [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
+    // B
+    [0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110],
+    // C
+    [0b01111, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b01111],
+    // D
+    [0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110],
+    // E
+    [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111],
+    // F
+    [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000],
+    // G
+    [0b01110, 0b10001, 0b10000, 0b10011, 0b10001, 0b10001, 0b01110],
+    // H
+    [0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
 ];
 
 // ── Data model ──────────────────────────────────────────────────────────
@@ -105,20 +125,29 @@ pub async fn load_mask(path: &Path) -> Result<Mask> {
 
 // ── Preview rendering (512×512) ─────────────────────────────────────────
 
-fn compute_image_rect(source: &DynamicImage, mode: AspectMode) -> (u32, u32, u32, u32) {
+/// Placement of the source image inside the 416×416 inner area, expressed in
+/// inner-local coordinates (x=0, y=0 is the top-left of the inner area, not
+/// the canvas). Stretch mode fills; fit mode letterboxes.
+fn image_rect_inner(source: &DynamicImage, mode: AspectMode) -> (u32, u32, u32, u32) {
     match mode {
-        AspectMode::Stretch => (GUTTER, GUTTER, INNER_SIZE, INNER_SIZE),
+        AspectMode::Stretch => (0, 0, INNER_SIZE, INNER_SIZE),
         AspectMode::Fit => {
             let sw = source.width();
             let sh = source.height();
-            let (new_w, new_h) = if sw >= sh {
-                (INNER_SIZE, ((INNER_SIZE as u64 * sh as u64) / sw as u64).max(1) as u32)
+            let (w, h) = if sw >= sh {
+                (
+                    INNER_SIZE,
+                    ((INNER_SIZE as u64 * sh as u64) / sw as u64).max(1) as u32,
+                )
             } else {
-                (((INNER_SIZE as u64 * sw as u64) / sh as u64).max(1) as u32, INNER_SIZE)
+                (
+                    ((INNER_SIZE as u64 * sw as u64) / sh as u64).max(1) as u32,
+                    INNER_SIZE,
+                )
             };
-            let x = GUTTER + (INNER_SIZE - new_w) / 2;
-            let y = GUTTER + (INNER_SIZE - new_h) / 2;
-            (x, y, new_w, new_h)
+            let x = (INNER_SIZE - w) / 2;
+            let y = (INNER_SIZE - h) / 2;
+            (x, y, w, h)
         }
     }
 }
@@ -126,62 +155,76 @@ fn compute_image_rect(source: &DynamicImage, mode: AspectMode) -> (u32, u32, u32
 fn render_preview(source: &DynamicImage, mask: &Mask) -> Result<RgbaImage> {
     let mut canvas = RgbaImage::from_pixel(CANVAS_SIZE, CANVAS_SIZE, BG_COLOR);
 
-    let (img_x, img_y, img_w, img_h) = compute_image_rect(source, mask.aspect_mode);
+    // Image goes where image_rect_inner says — centred in the inner area for
+    // fit, filling it for stretch.
+    let (iix, iiy, iw, ih) = image_rect_inner(source, mask.aspect_mode);
+    let img_x = GUTTER + iix;
+    let img_y = GUTTER + iiy;
 
-    // Resize source to target size, then blit into canvas
     let rgba = source.to_rgba8();
-    let resized = image::imageops::resize(&rgba, img_w, img_h, FilterType::Lanczos3);
+    let resized = image::imageops::resize(&rgba, iw, ih, FilterType::Lanczos3);
     for (x, y, p) in resized.enumerate_pixels() {
         canvas.put_pixel(img_x + x, img_y + y, *p);
     }
+
+    // Grid geometry is ALWAYS the full inner area, independent of aspect mode.
+    // In fit mode this means some cells fall on the letterbox bands; that's by
+    // design — masking those cells has no effect on the final mask.
+    let cell_w = INNER_SIZE / mask.cols;
+    let cell_h = INNER_SIZE / mask.rows;
 
     // Red overlay on masked cells
     for row in 0..mask.rows {
         for col in 0..mask.cols {
             let idx = (row * mask.cols + col) as usize;
             if mask.cells[idx] {
-                let x0 = img_x + col * img_w / mask.cols;
-                let y0 = img_y + row * img_h / mask.rows;
-                let x1 = img_x + (col + 1) * img_w / mask.cols;
-                let y1 = img_y + (row + 1) * img_h / mask.rows;
-                blend_rect(&mut canvas, x0, y0, x1 - x0, y1 - y0, OVERLAY_COLOR);
+                let x0 = GUTTER + col * cell_w;
+                let y0 = GUTTER + row * cell_h;
+                blend_rect(&mut canvas, x0, y0, cell_w, cell_h, OVERLAY_COLOR);
             }
         }
     }
 
-    // Grid lines spanning the actual image rect (not the canvas)
+    // Grid lines over the full inner area
     for i in 0..=mask.cols {
-        let x = (img_x + i * img_w / mask.cols).min(img_x + img_w - 1);
-        draw_vline(&mut canvas, x, img_y, img_y + img_h, GRID_COLOR);
+        let x = (GUTTER + i * cell_w).min(GUTTER + INNER_SIZE - 1);
+        draw_vline(&mut canvas, x, GUTTER, GUTTER + INNER_SIZE, GRID_COLOR);
     }
     for i in 0..=mask.rows {
-        let y = (img_y + i * img_h / mask.rows).min(img_y + img_h - 1);
-        draw_hline(&mut canvas, img_x, img_x + img_w, y, GRID_COLOR);
+        let y = (GUTTER + i * cell_h).min(GUTTER + INNER_SIZE - 1);
+        draw_hline(&mut canvas, GUTTER, GUTTER + INNER_SIZE, y, GRID_COLOR);
     }
 
-    // Gutter labels. Autoscale digits so they don't overflow the cell pitch
-    // (labels overlapping each other when the source is heavily letterboxed is
-    // worse than small digits).
-    let cell_w = img_w / mask.cols;
-    let cell_h = img_h / mask.rows;
+    // Labels on all four sides. Columns = letters A..H (top/bottom),
+    // rows = numbers 1..8 (left/right). Scale autoshrinks if cells are too
+    // small — not expected with fixed 52 px pitch, but keeps the code honest
+    // if the grid gets larger later.
     let col_scale = digit_scale_for(cell_w, GUTTER);
     let row_scale = digit_scale_for(cell_h, GUTTER);
 
+    let col_gw = DIGIT_W * col_scale;
+    let col_gh = DIGIT_H * col_scale;
+    let row_gw = DIGIT_W * row_scale;
+    let row_gh = DIGIT_H * row_scale;
+
+    let top_y = GUTTER.saturating_sub(col_gh) / 2;
+    let bot_y = CANVAS_SIZE - GUTTER + GUTTER.saturating_sub(col_gh) / 2;
     for col in 0..mask.cols {
-        let cell_mid_x = img_x + col * img_w / mask.cols + cell_w / 2;
-        let dw = DIGIT_W * col_scale;
-        let dh = DIGIT_H * col_scale;
-        let dx = cell_mid_x.saturating_sub(dw / 2);
-        let dy = GUTTER.saturating_sub(dh) / 2;
-        draw_digit(&mut canvas, dx, dy, col as usize, col_scale, LABEL_COLOR);
+        let cell_mid_x = GUTTER + col * cell_w + cell_w / 2;
+        let gx = cell_mid_x.saturating_sub(col_gw / 2);
+        let glyph = &LETTERS[col as usize];
+        draw_glyph(&mut canvas, gx, top_y, glyph, col_scale, LABEL_COLOR);
+        draw_glyph(&mut canvas, gx, bot_y, glyph, col_scale, LABEL_COLOR);
     }
+
+    let left_x = GUTTER.saturating_sub(row_gw) / 2;
+    let right_x = CANVAS_SIZE - GUTTER + GUTTER.saturating_sub(row_gw) / 2;
     for row in 0..mask.rows {
-        let cell_mid_y = img_y + row * img_h / mask.rows + cell_h / 2;
-        let dw = DIGIT_W * row_scale;
-        let dh = DIGIT_H * row_scale;
-        let dx = GUTTER.saturating_sub(dw) / 2;
-        let dy = cell_mid_y.saturating_sub(dh / 2);
-        draw_digit(&mut canvas, dx, dy, row as usize, row_scale, LABEL_COLOR);
+        let cell_mid_y = GUTTER + row * cell_h + cell_h / 2;
+        let gy = cell_mid_y.saturating_sub(row_gh / 2);
+        let glyph = &DIGITS[row as usize];
+        draw_glyph(&mut canvas, left_x, gy, glyph, row_scale, LABEL_COLOR);
+        draw_glyph(&mut canvas, right_x, gy, glyph, row_scale, LABEL_COLOR);
     }
 
     Ok(canvas)
@@ -236,13 +279,19 @@ fn draw_vline(canvas: &mut RgbaImage, x: u32, y0: u32, y1: u32, color: Rgba<u8>)
     }
 }
 
-/// Draw a digit. `digit_idx` is 0..=7 for the digits '1'..'8'. `scale` is the
-/// per-pixel block size — pass 1 for native 5×7, 4 for 20×28, etc.
-fn draw_digit(canvas: &mut RgbaImage, x: u32, y: u32, digit_idx: usize, scale: u32, color: Rgba<u8>) {
-    if digit_idx >= DIGITS.len() || scale == 0 {
+/// Draw a 5×7 bitmap glyph at `(x, y)`. `scale` is the per-pixel block size —
+/// pass 1 for native 5×7, 2 for 10×14, etc.
+fn draw_glyph(
+    canvas: &mut RgbaImage,
+    x: u32,
+    y: u32,
+    glyph: &[u8; 7],
+    scale: u32,
+    color: Rgba<u8>,
+) {
+    if scale == 0 {
         return;
     }
-    let glyph = &DIGITS[digit_idx];
     for (row, bits) in glyph.iter().enumerate() {
         for col in 0..DIGIT_W {
             let bit = 1u8 << (DIGIT_W - 1 - col);
@@ -266,26 +315,79 @@ fn digit_scale_for(pitch: u32, gutter: u32) -> u32 {
 
 // ── Final mask (source dimensions, greyscale) ──────────────────────────
 
-fn render_final_mask(src_w: u32, src_h: u32, mask: &Mask) -> ImageBuffer<Luma<u8>, Vec<u8>> {
-    let mut buf = ImageBuffer::from_pixel(src_w, src_h, Luma([0u8]));
-    for row in 0..mask.rows {
-        for col in 0..mask.cols {
-            let idx = (row * mask.cols + col) as usize;
-            if !mask.cells[idx] {
-                continue;
+fn render_final_mask(source: &DynamicImage, mask: &Mask) -> ImageBuffer<Luma<u8>, Vec<u8>> {
+    let sw = source.width();
+    let sh = source.height();
+    let mut buf = ImageBuffer::from_pixel(sw, sh, Luma([0u8]));
+
+    match mask.aspect_mode {
+        AspectMode::Stretch => {
+            // Cells map directly onto an evenly divided source: no letterbox
+            // to worry about, same as the preview.
+            for row in 0..mask.rows {
+                for col in 0..mask.cols {
+                    let idx = (row * mask.cols + col) as usize;
+                    if !mask.cells[idx] {
+                        continue;
+                    }
+                    let x0 = col * sw / mask.cols;
+                    let y0 = row * sh / mask.rows;
+                    let x1 = (col + 1) * sw / mask.cols;
+                    let y1 = (row + 1) * sh / mask.rows;
+                    fill_luma(&mut buf, x0, y0, x1, y1);
+                }
             }
-            let x0 = col * src_w / mask.cols;
-            let y0 = row * src_h / mask.rows;
-            let x1 = (col + 1) * src_w / mask.cols;
-            let y1 = (row + 1) * src_h / mask.rows;
-            for y in y0..y1 {
-                for x in x0..x1 {
-                    buf.put_pixel(x, y, Luma([255]));
+        }
+        AspectMode::Fit => {
+            // Grid lives over the full 416×416 inner area but the source image
+            // is letterboxed inside. For each masked cell: intersect the cell
+            // rect (in inner/preview coords) with the image rect, then map the
+            // intersection back to source coords. Cells that fall entirely on
+            // the letterbox contribute nothing.
+            let (iix, iiy, iw, ih) = image_rect_inner(source, AspectMode::Fit);
+            let cell_w = INNER_SIZE / mask.cols;
+            let cell_h = INNER_SIZE / mask.rows;
+            let img_x1 = iix + iw;
+            let img_y1 = iiy + ih;
+
+            for row in 0..mask.rows {
+                for col in 0..mask.cols {
+                    let idx = (row * mask.cols + col) as usize;
+                    if !mask.cells[idx] {
+                        continue;
+                    }
+                    let cx0 = col * cell_w;
+                    let cy0 = row * cell_h;
+                    let cx1 = (col + 1) * cell_w;
+                    let cy1 = (row + 1) * cell_h;
+
+                    let ix0 = cx0.max(iix);
+                    let iy0 = cy0.max(iiy);
+                    let ix1 = cx1.min(img_x1);
+                    let iy1 = cy1.min(img_y1);
+                    if ix0 >= ix1 || iy0 >= iy1 {
+                        continue;
+                    }
+
+                    let sx0 = ((ix0 - iix) as u64 * sw as u64 / iw as u64) as u32;
+                    let sy0 = ((iy0 - iiy) as u64 * sh as u64 / ih as u64) as u32;
+                    let sx1 = (((ix1 - iix) as u64 * sw as u64 / iw as u64) as u32).min(sw);
+                    let sy1 = (((iy1 - iiy) as u64 * sh as u64 / ih as u64) as u32).min(sh);
+                    fill_luma(&mut buf, sx0, sy0, sx1, sy1);
                 }
             }
         }
     }
+
     buf
+}
+
+fn fill_luma(buf: &mut ImageBuffer<Luma<u8>, Vec<u8>>, x0: u32, y0: u32, x1: u32, y1: u32) {
+    for y in y0..y1 {
+        for x in x0..x1 {
+            buf.put_pixel(x, y, Luma([255]));
+        }
+    }
 }
 
 // ── Encoders ────────────────────────────────────────────────────────────
@@ -360,7 +462,7 @@ pub async fn handle_create_mask(args: &Value) -> Result<CallToolResult> {
             let source = image::load_from_memory(&source_bytes)
                 .context("Failed to decode source image")?;
             let preview = render_preview(&source, &mask_for_render)?;
-            let final_mask = render_final_mask(source.width(), source.height(), &mask_for_render);
+            let final_mask = render_final_mask(&source, &mask_for_render);
             Ok((encode_jpeg(preview)?, encode_png_luma(final_mask)?))
         },
     )
