@@ -1,0 +1,4 @@
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"stdio-test","version":"0"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_image_metadata","arguments":{"path":"C:/Users/septa/Documents/Code/image-gen/comfy-ui-mcp/target/test-artifacts/inpaint-test-output_1.png"}}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_image_metadata","arguments":{"path":"C:/Users/septa/Documents/Code/image-gen/generated-gallery/09_dragon_flux_schnell.png"}}}

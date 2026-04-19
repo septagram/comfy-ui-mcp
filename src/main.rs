@@ -10,6 +10,7 @@
 
 mod comfy;
 mod mcp;
+mod metadata;
 mod setup;
 mod tools;
 

@@ -8,10 +8,12 @@ use std::time::Duration;
 use tracing::info;
 
 use crate::comfy::{
-    ComfyClient, LoraSpec, build_checkpoint_workflow, build_flux_workflow, build_ip2p_workflow,
-    ip2p_defaults, is_ip2p_model, parse_model_specifier,
+    ComfyClient, LoraSpec, build_checkpoint_workflow, build_flux_inpaint_workflow,
+    build_flux_workflow, build_ip2p_workflow, ip2p_defaults, is_flux_inpaint_model, is_ip2p_model,
+    parse_model_specifier,
 };
 use crate::mcp::{CallToolResult, ContentItem, ToolDefinition};
+use crate::metadata::read_image_metadata;
 
 /// Return the list of tool definitions with JSON Schemas.
 pub fn tool_definitions() -> Vec<ToolDefinition> {
@@ -94,11 +96,84 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     "return_image": {
                         "type": "string",
                         "enum": ["none", "thumb", "full"],
-                        "description": "Whether to return image data inline. 'thumb' (recommended) returns a 256x256 JPEG preview — use this by default for quick visual checks. 'full' returns the complete image as JPEG — only use when full resolution comprehension is required (risks hitting context limits). 'none' returns only the file path. Default: 'none'.",
-                        "default": "none"
+                        "description": "Whether to return image data inline. 'thumb' (default) returns a 256x256 JPEG preview — enough for the calling model to see what was produced. 'full' returns the complete image as JPEG — only when full-resolution comprehension matters (risks hitting context limits). 'none' returns only the file path — for mass-production runs where examination is deferred or handled by a separate agent. Default: 'thumb'.",
+                        "default": "thumb"
                     }
                 },
                 "required": ["prompt"]
+            }),
+        },
+        ToolDefinition {
+            name: "inpaint_image".into(),
+            description: "Inpaint part of an image using FLUX.1-Fill-dev. Provide a base image, a mask (white = replace, black = keep), and a DESCRIPTIVE prompt of what should appear in the masked region. Do NOT phrase as an edit instruction — Fill-dev is not instruction-tuned. Write 'a red leather hat with a feather', not 'add a red hat'. For removals, describe what should fill the void, not the removal — e.g. 'empty park bench, grass, dappled light', not 'remove the person'. Describe only the masked region; the rest of the image conditions the model automatically. Greyscale mask pixels give partial blending but prefer binary (pure black/white) PNG masks for predictable seams. Mask is read from the PNG's red channel (so a plain black-and-white mask image works — no alpha needed).".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "source_image": {
+                        "type": "string",
+                        "description": "Absolute path to the base image to inpaint."
+                    },
+                    "mask": {
+                        "type": "string",
+                        "description": "Absolute path to the mask PNG. White pixels are replaced, black pixels are kept. Read from the red channel."
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "Descriptive prompt of what appears in the masked region (not an edit instruction)."
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "FLUX-inpaint model to use (e.g. 'diffusion_models/flux1-fill-dev-Q8_0.gguf'). Defaults to the first available fill model. Non-inpaint models are rejected."
+                    },
+                    "lora": {
+                        "type": "string",
+                        "description": "Optional LoRA filename (applied on top of Fill-dev)."
+                    },
+                    "lora_strength": {
+                        "type": "number",
+                        "description": "LoRA strength (0.0-1.0).",
+                        "default": 0.8
+                    },
+                    "steps": {
+                        "type": "integer",
+                        "description": "Sampling steps. Default 20.",
+                        "default": 20
+                    },
+                    "seed": {
+                        "type": "integer",
+                        "description": "Random seed. Omit for random."
+                    },
+                    "count": {
+                        "type": "integer",
+                        "description": "Number of inpaints to generate. Each gets a different seed (base + index).",
+                        "default": 1
+                    },
+                    "output_path": {
+                        "type": "string",
+                        "description": "File path to save. Temp file if omitted. When count > 1, index is appended before extension."
+                    },
+                    "return_image": {
+                        "type": "string",
+                        "enum": ["none", "thumb", "full"],
+                        "description": "Whether to return image data inline. 'thumb' (default) returns a 256x256 JPEG preview. 'full' returns the complete image as JPEG. 'none' returns only the file path. Default: 'thumb'.",
+                        "default": "thumb"
+                    }
+                },
+                "required": ["source_image", "mask", "prompt"]
+            }),
+        },
+        ToolDefinition {
+            name: "read_image_metadata".into(),
+            description: "Read generation metadata baked into a PNG file. Returns the text prompt and (if available) model, seed, sampler, steps, cfg, and LoRA for images generated by ComfyUI or Automatic1111. Use this to reference a past image — e.g. regenerate a variation with the same prompt, or see what settings produced a particular result.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute path to a PNG file."
+                    }
+                },
+                "required": ["path"]
             }),
         },
         ToolDefinition {
@@ -129,6 +204,8 @@ pub async fn handle_tool_call(
 ) -> Result<CallToolResult> {
     match tool_name {
         "generate_image" => handle_generate_image(client, args).await,
+        "inpaint_image" => handle_inpaint_image(client, args).await,
+        "read_image_metadata" => handle_read_image_metadata(args).await,
         "list_models" => handle_list_models(client).await,
         // Keep old name working for backwards compat
         "list_checkpoints" => handle_list_models(client).await,
@@ -182,7 +259,7 @@ fn default_denoise() -> f64 {
     0.75
 }
 fn default_return_image() -> String {
-    "none".into()
+    "thumb".into()
 }
 fn default_count() -> u32 {
     1
@@ -390,6 +467,192 @@ async fn handle_system_status(client: &ComfyClient) -> Result<CallToolResult> {
     Ok(CallToolResult {
         content: vec![ContentItem::Text {
             text: serde_json::to_string_pretty(&stats)?,
+        }],
+        is_error: false,
+    })
+}
+
+// ── inpaint_image ──────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct InpaintImageArgs {
+    source_image: String,
+    mask: String,
+    prompt: String,
+    model: Option<String>,
+    lora: Option<String>,
+    #[serde(default = "default_lora_strength")]
+    lora_strength: f64,
+    #[serde(default = "default_inpaint_steps")]
+    steps: u32,
+    seed: Option<i64>,
+    #[serde(default = "default_count")]
+    count: u32,
+    output_path: Option<String>,
+    #[serde(default = "default_return_image")]
+    return_image: String,
+}
+
+fn default_inpaint_steps() -> u32 {
+    20
+}
+
+async fn handle_inpaint_image(client: &ComfyClient, args: &Value) -> Result<CallToolResult> {
+    let args: InpaintImageArgs = serde_json::from_value(args.clone())?;
+
+    // Resolve model — default to the first available fill model.
+    let (folder, filename) = match args.model.as_deref() {
+        Some(spec) if !spec.is_empty() => {
+            let (f, n) = parse_model_specifier(spec)?;
+            (f.to_string(), n.to_string())
+        }
+        _ => {
+            let all = client.list_all_models().await?;
+            let fill = all.iter().find_map(|full| {
+                let (f, n) = full.split_once('/')?;
+                is_flux_inpaint_model(n).then(|| (f.to_string(), n.to_string()))
+            });
+            fill.ok_or_else(|| anyhow::anyhow!(
+                "No FLUX-inpaint model found. Download e.g. flux1-fill-dev-Q8_0.gguf into ComfyUI/models/diffusion_models/ and restart ComfyUI."
+            ))?
+        }
+    };
+
+    if !is_flux_inpaint_model(&filename) {
+        bail!(
+            "inpaint_image requires a FLUX-inpaint model (filename must contain 'flux' and 'fill'), but got '{filename}'. \
+             For InstructPix2Pix or CosXL editing, use generate_image with source_image instead."
+        );
+    }
+
+    let lora_spec = args.lora.as_ref().map(|name| LoraSpec {
+        name: name.clone(),
+        strength: args.lora_strength,
+    });
+
+    let seed = args.seed.unwrap_or_else(|| rand::random::<i64>().abs());
+    let count = args.count.max(1);
+    let pad = if count <= 1 { 1 } else { (count as f64).log10() as usize + 1 };
+
+    info!(
+        prompt = %args.prompt,
+        model = format!("{folder}/{filename}"),
+        lora = args.lora.as_deref().unwrap_or("none"),
+        steps = args.steps,
+        seed = seed,
+        count = count,
+        "Processing inpaint request"
+    );
+
+    let base_path: PathBuf = match &args.output_path {
+        Some(p) => PathBuf::from(p),
+        None => {
+            let temp_dir = std::env::temp_dir().join("comfy-ui-mcp");
+            tokio::fs::create_dir_all(&temp_dir).await?;
+            let batch_id = &format!("{:08x}", rand::random::<u32>());
+            temp_dir.join(format!("inpaint_{batch_id}.png"))
+        }
+    };
+
+    // Upload source + mask once (same inputs for each iteration)
+    let uploaded_base = client.upload_image(&args.source_image).await?;
+    let uploaded_mask = client.upload_image(&args.mask).await?;
+
+    let mut results_json = Vec::new();
+    let mut content = Vec::new();
+
+    for i in 0..count {
+        let iter_seed = seed.wrapping_add(i as i64);
+
+        let workflow = build_flux_inpaint_workflow(
+            &filename,
+            &uploaded_base,
+            &uploaded_mask,
+            &args.prompt,
+            args.steps,
+            iter_seed,
+            lora_spec.as_ref(),
+        );
+
+        let prompt_id = client.submit_prompt(&workflow).await?;
+        info!(prompt_id = %prompt_id, index = i + 1, count = count, "Submitted inpaint to ComfyUI");
+
+        let outputs = client
+            .wait_for_completion(&prompt_id, Duration::from_secs(300))
+            .await?;
+        let output = outputs
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("No image output found for inpaint {}", i + 1))?;
+
+        let image_bytes = client.fetch_image(output).await?;
+
+        let file_path = indexed_path(&base_path, i as usize, pad);
+        if let Some(parent) = file_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::write(&file_path, &image_bytes).await?;
+
+        let file_path_str = file_path.to_string_lossy().to_string();
+        info!(path = %file_path_str, index = i + 1, bytes = image_bytes.len(), "Inpaint saved");
+
+        results_json.push(serde_json::json!({
+            "file_path": file_path_str,
+            "seed": iter_seed,
+            "index": i + 1,
+            "model": format!("{folder}/{filename}"),
+            "lora": args.lora,
+        }));
+
+        match args.return_image.as_str() {
+            "thumb" => {
+                let img = image::load_from_memory(&image_bytes)?;
+                let thumb = img.thumbnail(256, 256);
+                let mut buf = std::io::Cursor::new(Vec::new());
+                thumb.write_to(&mut buf, image::ImageFormat::Jpeg)?;
+                content.push(ContentItem::Image {
+                    data: BASE64.encode(buf.into_inner()),
+                    mime_type: "image/jpeg".into(),
+                });
+            }
+            "full" | "true" => {
+                let img = image::load_from_memory(&image_bytes)?;
+                let mut buf = std::io::Cursor::new(Vec::new());
+                img.write_to(&mut buf, image::ImageFormat::Jpeg)?;
+                content.push(ContentItem::Image {
+                    data: BASE64.encode(buf.into_inner()),
+                    mime_type: "image/jpeg".into(),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    content.insert(
+        0,
+        ContentItem::Text {
+            text: serde_json::to_string(&results_json)?,
+        },
+    );
+
+    Ok(CallToolResult {
+        content,
+        is_error: false,
+    })
+}
+
+// ── read_image_metadata ────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct ReadImageMetadataArgs {
+    path: String,
+}
+
+async fn handle_read_image_metadata(args: &Value) -> Result<CallToolResult> {
+    let args: ReadImageMetadataArgs = serde_json::from_value(args.clone())?;
+    let report = read_image_metadata(std::path::Path::new(&args.path))?;
+    Ok(CallToolResult {
+        content: vec![ContentItem::Text {
+            text: serde_json::to_string_pretty(&report)?,
         }],
         is_error: false,
     })

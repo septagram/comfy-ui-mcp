@@ -172,6 +172,24 @@ Should return the node info with `flux1-schnell-Q8_0.gguf` in the available mode
 
 ---
 
+## FLUX.1-Fill-dev Setup (Inpainting, GGUF Quantized)
+
+Fill-dev is a purpose-built inpainting variant of FLUX. It reuses the same text encoders and VAE as schnell — only the unet differs. Community Q8_0 GGUF quant fits in 16 GB VRAM.
+
+Source repo: `YarvixPA/FLUX.1-Fill-dev-GGUF` (no auth required, not gated).
+
+```bash
+.venv\Scripts\python -c "from huggingface_hub import hf_hub_download; hf_hub_download('YarvixPA/FLUX.1-Fill-dev-GGUF', 'flux1-fill-dev-Q8_0.gguf', local_dir='models/diffusion_models')"
+```
+
+~12.7 GB. Lives in the same `models/diffusion_models/` folder as schnell and is loaded via `UnetLoaderGGUF` from the existing ComfyUI-GGUF custom node. Restart ComfyUI so the loader sees it.
+
+The MCP server's `inpaint_image` tool auto-detects this model by filename (matches `flux*fill*`).
+
+Smaller/larger quants are available in the same repo (Q3_K_S 5.2 GB → Q8_0 12.7 GB → safetensors 23.8 GB); Q8_0 is the highest-fidelity option that still fits 16 GB VRAM.
+
+---
+
 ## Troubleshooting
 
 ### `ValueError: cannot reshape array of size X into shape (Y,Z)`

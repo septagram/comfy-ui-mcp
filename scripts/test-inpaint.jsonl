@@ -1,0 +1,3 @@
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"stdio-test","version":"0"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"inpaint_image","arguments":{"source_image":"C:/Users/septa/Documents/Code/image-gen/generated-gallery/09_dragon_flux_schnell.png","mask":"C:/Users/septa/Documents/Code/image-gen/comfy-ui-mcp/target/test-artifacts/mask-center.png","prompt":"a large glowing red crystal shard on an ornate stone pedestal, magical runes carved into the base","output_path":"C:/Users/septa/Documents/Code/image-gen/comfy-ui-mcp/target/test-artifacts/inpaint-test-output.png","return_image":"none","seed":42}}}

@@ -78,19 +78,23 @@ impl ComfyClient {
     pub async fn submit_prompt(&self, workflow: &Value) -> Result<String> {
         let url = format!("{}/prompt", self.base_url);
         let body = serde_json::json!({ "prompt": workflow });
-        let resp: Value = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await?
-            .json()
-            .await?;
+        let resp = self.client.post(&url).json(&body).send().await?;
+        let status = resp.status();
+        let body_text = resp.text().await?;
+        let parsed: Value = serde_json::from_str(&body_text).unwrap_or(Value::Null);
 
-        resp["prompt_id"]
-            .as_str()
-            .map(String::from)
-            .context("No prompt_id in response")
+        if let Some(id) = parsed.get("prompt_id").and_then(|v| v.as_str()) {
+            return Ok(id.to_string());
+        }
+
+        // ComfyUI returns node-level errors under `node_errors`; workflow-level
+        // errors under `error`. Surface whichever is present.
+        let detail = parsed
+            .get("node_errors")
+            .or_else(|| parsed.get("error"))
+            .map(|v| v.to_string())
+            .unwrap_or(body_text);
+        bail!("ComfyUI rejected workflow (HTTP {status}): {detail}");
     }
 
     /// Poll history until the prompt completes. Returns the output node's images info.
@@ -483,6 +487,13 @@ pub fn is_ip2p_model(filename: &str) -> bool {
         || lower.contains("cosxl_edit")
 }
 
+/// Check if a model filename is a FLUX.1-Fill-style inpainting model.
+/// Matches files that mention both "flux" and "fill", e.g. `flux1-fill-dev-Q8_0.gguf`.
+pub fn is_flux_inpaint_model(filename: &str) -> bool {
+    let lower = filename.to_lowercase();
+    lower.contains("flux") && lower.contains("fill")
+}
+
 /// Check if an IP2P model is CosXL (SDXL-based, higher res defaults).
 fn is_cosxl_model(filename: &str) -> bool {
     filename.to_lowercase().contains("cosxl")
@@ -607,6 +618,149 @@ pub fn build_ip2p_workflow(
             "sampler_name": sampler,
             "scheduler": "normal",
             "denoise": denoise
+        }
+    });
+
+    workflow
+}
+
+/// Build a FLUX.1-Fill inpainting workflow. Uses `UnetLoaderGGUF` for the unet,
+/// `DualCLIPLoader` for CLIP, `VAELoader` for the VAE (all shared with FLUX txt2img),
+/// plus `LoadImage` + `LoadImageMask` for the editing inputs and `InpaintModelConditioning`
+/// to prep the latent. Mask is read from the uploaded greyscale PNG's red channel so users
+/// can paint masks in any tool without worrying about alpha channels.
+///
+/// Width/height are derived from the source image by the conditioning node — no latent
+/// dimensions passed in. Denoise is fixed at 1.0; Fill-dev respects the mask internally.
+pub fn build_flux_inpaint_workflow(
+    unet_name: &str,
+    uploaded_base_name: &str,
+    uploaded_mask_name: &str,
+    prompt: &str,
+    steps: u32,
+    seed: i64,
+    lora: Option<&LoraSpec>,
+) -> Value {
+    let mut workflow = serde_json::json!({
+        "1": {
+            "class_type": "UnetLoaderGGUF",
+            "inputs": { "unet_name": unet_name }
+        },
+        "2": {
+            "class_type": "DualCLIPLoader",
+            "inputs": {
+                "clip_name1": "clip_l.safetensors",
+                "clip_name2": "t5xxl_fp8_e4m3fn.safetensors",
+                "type": "flux"
+            }
+        },
+        "13": {
+            "class_type": "VAELoader",
+            "inputs": { "vae_name": "ae.safetensors" }
+        },
+        "20": {
+            "class_type": "LoadImage",
+            "inputs": { "image": uploaded_base_name }
+        },
+        "21": {
+            "class_type": "LoadImageMask",
+            "inputs": {
+                "image": uploaded_mask_name,
+                "channel": "red"
+            }
+        },
+        "9": {
+            "class_type": "SaveImage",
+            "inputs": {
+                "images": ["8", 0],
+                "filename_prefix": "mcp_flux_inpaint"
+            }
+        }
+    });
+
+    // Model/clip source — optionally through LoRA (same shape as build_flux_workflow)
+    let (model_ref, clip_ref): (Value, Value) = match lora {
+        Some(lora) => {
+            workflow["10"] = serde_json::json!({
+                "class_type": "LoraLoader",
+                "inputs": {
+                    "model": ["1", 0],
+                    "clip": ["2", 0],
+                    "lora_name": lora.name,
+                    "strength_model": lora.strength,
+                    "strength_clip": lora.strength
+                }
+            });
+            (serde_json::json!(["10", 0]), serde_json::json!(["10", 1]))
+        }
+        None => (serde_json::json!(["1", 0]), serde_json::json!(["2", 0])),
+    };
+
+    // Positive + (empty) negative text conditioning
+    workflow["3"] = serde_json::json!({
+        "class_type": "CLIPTextEncode",
+        "inputs": { "text": prompt, "clip": clip_ref }
+    });
+    workflow["4"] = serde_json::json!({
+        "class_type": "CLIPTextEncode",
+        "inputs": { "text": "", "clip": clip_ref }
+    });
+
+    // Inpaint conditioning: fuses text conditioning with source pixels + mask.
+    // noise_mask=true attaches the mask to the latent so the sampler only denoises
+    // inside the masked region.
+    workflow["22"] = serde_json::json!({
+        "class_type": "InpaintModelConditioning",
+        "inputs": {
+            "positive": ["3", 0],
+            "negative": ["4", 0],
+            "vae": ["13", 0],
+            "pixels": ["20", 0],
+            "mask": ["21", 0],
+            "noise_mask": true
+        }
+    });
+
+    // FLUX advanced sampler pipeline (mirrors build_flux_workflow)
+    workflow["5"] = serde_json::json!({
+        "class_type": "RandomNoise",
+        "inputs": { "noise_seed": seed }
+    });
+    workflow["6"] = serde_json::json!({
+        "class_type": "BasicGuider",
+        "inputs": {
+            "model": model_ref,
+            "conditioning": ["22", 0]
+        }
+    });
+    workflow["11"] = serde_json::json!({
+        "class_type": "BasicScheduler",
+        "inputs": {
+            "model": model_ref,
+            "scheduler": "simple",
+            "steps": steps,
+            "denoise": 1.0
+        }
+    });
+    workflow["12"] = serde_json::json!({
+        "class_type": "KSamplerSelect",
+        "inputs": { "sampler_name": "euler" }
+    });
+    workflow["7"] = serde_json::json!({
+        "class_type": "SamplerCustomAdvanced",
+        "inputs": {
+            "noise": ["5", 0],
+            "guider": ["6", 0],
+            "sampler": ["12", 0],
+            "sigmas": ["11", 0],
+            "latent_image": ["22", 2]
+        }
+    });
+    workflow["8"] = serde_json::json!({
+        "class_type": "VAEDecode",
+        "inputs": {
+            "samples": ["7", 0],
+            "vae": ["13", 0]
         }
     });
 
