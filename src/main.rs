@@ -9,6 +9,7 @@
 )]
 
 mod comfy;
+mod mask;
 mod mcp;
 mod metadata;
 mod setup;
