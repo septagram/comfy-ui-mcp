@@ -422,13 +422,14 @@ struct CreateMaskArgs {
 }
 
 fn default_init() -> String {
-    "random".into()
+    "none".into()
 }
 
 pub async fn handle_create_mask(args: &Value) -> Result<CallToolResult> {
     let args: CreateMaskArgs = serde_json::from_value(args.clone())?;
 
-    let (mask_path, preview_path, final_mask_path) = resolve_paths(args.path.as_deref()).await?;
+    let mask_path = resolve_new_mask_path(args.path.as_deref()).await?;
+    let (preview_path, final_mask_path) = derive_sidecar_paths(&mask_path);
 
     let source_bytes = tokio::fs::read(&args.source_image)
         .await
@@ -456,6 +457,120 @@ pub async fn handle_create_mask(args: &Value) -> Result<CallToolResult> {
         "Rendering mask sidecars"
     );
 
+    let preview_jpeg =
+        render_and_save_sidecars(&mask, source_bytes, &preview_path, &final_mask_path).await?;
+
+    Ok(build_mask_response(
+        &mask,
+        &mask_path,
+        &preview_path,
+        &final_mask_path,
+        &preview_jpeg,
+        None,
+    )?)
+}
+
+// ── fill_slot ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct FillSlotArgs {
+    path: String,
+    cells: String,
+    #[serde(default = "default_with")]
+    with: i64,
+}
+
+fn default_with() -> i64 {
+    1
+}
+
+pub async fn handle_fill_slot(args: &Value) -> Result<CallToolResult> {
+    let args: FillSlotArgs = serde_json::from_value(args.clone())?;
+
+    let with_value = match args.with {
+        0 => false,
+        1 => true,
+        other => anyhow::bail!(
+            "'with' must be 0 or 1 (got {other}); richer fill types are reserved for later"
+        ),
+    };
+
+    let mask_path = ensure_mask_suffix(&args.path);
+    let mut mask = load_mask(&mask_path).await?;
+
+    let targets = parse_cell_spec(&args.cells, mask.cols, mask.rows)?;
+    let applied = targets.len();
+    for (col, row) in &targets {
+        let idx = (row * mask.cols + col) as usize;
+        mask.cells[idx] = with_value;
+    }
+
+    save_mask(&mask_path, &mask).await?;
+
+    let (preview_path, final_mask_path) = derive_sidecar_paths(&mask_path);
+    let source_bytes = tokio::fs::read(&mask.source_image)
+        .await
+        .with_context(|| format!("Source image missing: {}", mask.source_image))?;
+
+    info!(
+        mask_path = %mask_path.display(),
+        cells_applied = applied,
+        with_value = with_value,
+        "Applying fill_slot"
+    );
+
+    let preview_jpeg =
+        render_and_save_sidecars(&mask, source_bytes, &preview_path, &final_mask_path).await?;
+
+    Ok(build_mask_response(
+        &mask,
+        &mask_path,
+        &preview_path,
+        &final_mask_path,
+        &preview_jpeg,
+        Some(applied),
+    )?)
+}
+
+// ── Shared path / write / response helpers ─────────────────────────────
+
+fn ensure_mask_suffix(user_path: &str) -> PathBuf {
+    let p = PathBuf::from(user_path);
+    if p.extension().and_then(|e| e.to_str()) == Some("mask") {
+        p
+    } else {
+        PathBuf::from(format!("{}.mask", p.to_string_lossy()))
+    }
+}
+
+fn derive_sidecar_paths(mask_path: &Path) -> (PathBuf, PathBuf) {
+    let s = mask_path.to_string_lossy().to_string();
+    (
+        PathBuf::from(format!("{s}.preview.jpg")),
+        PathBuf::from(format!("{s}.png")),
+    )
+}
+
+async fn resolve_new_mask_path(user_path: Option<&str>) -> Result<PathBuf> {
+    match user_path {
+        Some(p) if !p.is_empty() => Ok(ensure_mask_suffix(p)),
+        _ => {
+            let tmp = std::env::temp_dir().join("comfy-ui-mcp");
+            tokio::fs::create_dir_all(&tmp).await?;
+            let id = format!("{:08x}", rand::random::<u32>());
+            Ok(tmp.join(format!("mask_{id}.mask")))
+        }
+    }
+}
+
+/// Render preview + final-mask from the source bytes, write both sidecars
+/// in parallel, return the preview JPEG bytes so the handler can inline them.
+async fn render_and_save_sidecars(
+    mask: &Mask,
+    source_bytes: Vec<u8>,
+    preview_path: &Path,
+    final_mask_path: &Path,
+) -> Result<Vec<u8>> {
     let mask_for_render = mask.clone();
     let (preview_jpeg, final_mask_png) = tokio::task::spawn_blocking(
         move || -> Result<(Vec<u8>, Vec<u8>)> {
@@ -469,15 +584,26 @@ pub async fn handle_create_mask(args: &Value) -> Result<CallToolResult> {
     .await??;
 
     tokio::try_join!(
-        tokio::fs::write(&preview_path, &preview_jpeg),
-        tokio::fs::write(&final_mask_path, &final_mask_png),
+        tokio::fs::write(preview_path, &preview_jpeg),
+        tokio::fs::write(final_mask_path, &final_mask_png),
     )?;
 
+    Ok(preview_jpeg)
+}
+
+fn build_mask_response(
+    mask: &Mask,
+    mask_path: &Path,
+    preview_path: &Path,
+    final_mask_path: &Path,
+    preview_jpeg: &[u8],
+    cells_applied: Option<usize>,
+) -> Result<CallToolResult> {
     let aspect_str = match mask.aspect_mode {
         AspectMode::Fit => "fit",
         AspectMode::Stretch => "stretch",
     };
-    let response = serde_json::json!({
+    let mut response = serde_json::json!({
         "mask_path": mask_path.to_string_lossy(),
         "preview_path": preview_path.to_string_lossy(),
         "final_mask_path": final_mask_path.to_string_lossy(),
@@ -486,6 +612,9 @@ pub async fn handle_create_mask(args: &Value) -> Result<CallToolResult> {
         "rows": mask.rows,
         "aspect_mode": aspect_str,
     });
+    if let Some(n) = cells_applied {
+        response["cells_applied"] = serde_json::json!(n);
+    }
 
     Ok(CallToolResult {
         content: vec![
@@ -493,7 +622,7 @@ pub async fn handle_create_mask(args: &Value) -> Result<CallToolResult> {
                 text: serde_json::to_string(&response)?,
             },
             ContentItem::Image {
-                data: BASE64.encode(&preview_jpeg),
+                data: BASE64.encode(preview_jpeg),
                 mime_type: "image/jpeg".into(),
             },
         ],
@@ -501,29 +630,85 @@ pub async fn handle_create_mask(args: &Value) -> Result<CallToolResult> {
     })
 }
 
-async fn resolve_paths(user_path: Option<&str>) -> Result<(PathBuf, PathBuf, PathBuf)> {
-    let mask_path: PathBuf = match user_path {
-        Some(p) if !p.is_empty() => {
-            let p = PathBuf::from(p);
-            if p.extension().and_then(|e| e.to_str()) == Some("mask") {
-                p
-            } else {
-                PathBuf::from(format!("{}.mask", p.to_string_lossy()))
+// ── Cell-spec parser ───────────────────────────────────────────────────
+
+/// Parse a cell-spec string like `"A2, B3-D5, E1"` into (col, row) pairs,
+/// both 0-indexed. Cells accept letter-digit in either order; rectangles
+/// are inclusive and direction-insensitive; whitespace freely ignored.
+fn parse_cell_spec(input: &str, cols: u32, rows: u32) -> Result<Vec<(u32, u32)>> {
+    let trimmed: String = input.chars().filter(|c| !c.is_whitespace()).collect();
+    if trimmed.is_empty() {
+        anyhow::bail!("cells spec is empty");
+    }
+
+    let mut out = Vec::new();
+    for part in trimmed.split(',') {
+        if part.is_empty() {
+            continue;
+        }
+        if let Some(dash) = part.find('-') {
+            let a = parse_cell(&part[..dash], cols, rows)?;
+            let b = parse_cell(&part[dash + 1..], cols, rows)?;
+            let (c0, c1) = (a.0.min(b.0), a.0.max(b.0));
+            let (r0, r1) = (a.1.min(b.1), a.1.max(b.1));
+            for r in r0..=r1 {
+                for c in c0..=c1 {
+                    out.push((c, r));
+                }
             }
+        } else {
+            out.push(parse_cell(part, cols, rows)?);
         }
-        _ => {
-            let tmp = std::env::temp_dir().join("comfy-ui-mcp");
-            tokio::fs::create_dir_all(&tmp).await?;
-            let id = format!("{:08x}", rand::random::<u32>());
-            tmp.join(format!("mask_{id}.mask"))
+    }
+
+    if out.is_empty() {
+        anyhow::bail!("cells spec is empty");
+    }
+    Ok(out)
+}
+
+/// Parse a single cell address like "A2" or "1A" (letter-digit or digit-letter).
+fn parse_cell(s: &str, cols: u32, rows: u32) -> Result<(u32, u32)> {
+    if s.is_empty() {
+        anyhow::bail!("cell address is empty");
+    }
+    let mut letter: Option<char> = None;
+    let mut digit: Option<char> = None;
+    for c in s.chars() {
+        if c.is_ascii_alphabetic() {
+            if letter.is_some() {
+                anyhow::bail!("cell '{s}': multiple letters not allowed");
+            }
+            letter = Some(c.to_ascii_uppercase());
+        } else if c.is_ascii_digit() {
+            if digit.is_some() {
+                anyhow::bail!("cell '{s}': multiple digits not allowed");
+            }
+            digit = Some(c);
+        } else {
+            anyhow::bail!("cell '{s}': unexpected character '{c}'");
         }
-    };
+    }
 
-    let mask_str = mask_path.to_string_lossy().to_string();
-    let preview_path = PathBuf::from(format!("{mask_str}.preview.jpg"));
-    let final_mask_path = PathBuf::from(format!("{mask_str}.png"));
+    let letter = letter.ok_or_else(|| anyhow::anyhow!("cell '{s}': missing column letter"))?;
+    let digit = digit.ok_or_else(|| anyhow::anyhow!("cell '{s}': missing row number"))?;
 
-    Ok((mask_path, preview_path, final_mask_path))
+    let col = (letter as u32).wrapping_sub('A' as u32);
+    let digit_val = digit.to_digit(10).unwrap();
+    if digit_val == 0 {
+        anyhow::bail!("cell '{s}': row must be 1..{rows} (got 0)");
+    }
+    let row = digit_val - 1;
+
+    if col >= cols {
+        let max_col = (b'A' + (cols as u8) - 1) as char;
+        anyhow::bail!("cell '{s}': column '{letter}' out of range (A..{max_col})");
+    }
+    if row >= rows {
+        anyhow::bail!("cell '{s}': row '{digit}' out of range (1..{rows})");
+    }
+
+    Ok((col, row))
 }
 
 fn init_cells(init: &str, cols: u32, rows: u32, seed: Option<u64>) -> Result<Vec<bool>> {
