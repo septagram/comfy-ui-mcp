@@ -1,3 +1,11 @@
+## 1.3.0
+
+- Add `create_mask` tool: stands up an editable mask object tied to a source image. Writes a `.mask` state file (ASON, versioned for future format changes), a greyscale PNG at source dimensions (drop straight into `inpaint_image`), and a 512×512 annotated preview JPEG with an 8×8 grid, column letters A–H and row numbers 1–8 on all four sides, and masked cells tinted red. `aspect_mode` flag picks between `"fit"` (letterboxed, preserves aspect ratio) and `"stretch"` (fills the inner square). Fit-mode final-mask PNGs correctly "unfit" — cells that fall on the letterbox bands contribute nothing to the source-sized output.
+- Add `fill_slot` tool: flexible cell-spec editing of an existing mask. Accepts single cells (`"A2"`), inclusive rectangles in any corner order (`"A2-C4"`, `"C4-A2"`), and comma-separated combinations (`"A1, B2-D4, E1-E3"`). Letter/digit order inside a cell is free (`"1A"` == `"A1"`), whitespace ignored, case-insensitive. `with: 0` clears, `with: 1` (default) fills.
+- Both mask tools regenerate the three files on every call and return all paths plus the updated preview inline, so the model editing the mask sees its changes immediately without a separate view step.
+- `inpaint_image` description now points at `create_mask` / `fill_slot` so it's obvious they're the authoring path when a mask doesn't exist on disk yet.
+- Security: `cargo audit` surfaced two `rustls-webpki` vulnerabilities (RUSTSEC-2026-0098 / -0099, certificate name-constraint handling) and one `rand` unsoundness (RUSTSEC-2026-0097). All three fixed by in-range patch bumps (`rustls-webpki` 0.103.10 → 0.103.12, `rand` 0.9.2 → 0.9.4). Clean audit.
+
 ## 1.2.0
 
 - Add `inpaint_image` tool: FLUX.1-Fill-dev inpainting with separate source-image and mask uploads, optional LoRA, and descriptive-prompt guidance baked into the tool description (Fill-dev is not instruction-tuned). Mask is read from the red channel so any greyscale PNG works without alpha-channel gymnastics.
