@@ -1,3 +1,11 @@
+## 1.4.0
+
+**Breaking**: `lora` + `lora_strength` fields are removed from `generate_image` and `inpaint_image`. Use the new `loras` array instead.
+
+- `loras`: array of `{name, strength, strength_clip?}` entries. Multiple entries stack — each one layers on top of the previous. Omit or pass `[]` for no LoRA.
+- `strength` drives the UNet contribution (`strength_model` in ComfyUI terms); `strength_clip` overrides the CLIP text-encoder weight (defaults to `strength`). The override exists specifically for stacking: when two LoRAs both steer CLIP at full weight, the text encoder gets muddled ("CLIP conflict") and prompt adherence degrades even though UNet contributions stack fine. Rule of thumb baked into the tool description: lead LoRA at full CLIP, supporting LoRAs with CLIP dialed down (often 0.0–0.3).
+- Chain uses string node IDs `lora_0`, `lora_1`, … in the ComfyUI workflow — self-labelling when inspected via `read_image_metadata`.
+
 ## 1.3.0
 
 - Add `create_mask` tool: stands up an editable mask object tied to a source image. Writes a `.mask` state file (ASON, versioned for future format changes), a greyscale PNG at source dimensions (drop straight into `inpaint_image`), and a 512×512 annotated preview JPEG with an 8×8 grid, column letters A–H and row numbers 1–8 on all four sides, and masked cells tinted red. `aspect_mode` flag picks between `"fit"` (letterboxed, preserves aspect ratio) and `"stretch"` (fills the inner square). Fit-mode final-mask PNGs correctly "unfit" — cells that fall on the letterbox bands contribute nothing to the source-sized output.
