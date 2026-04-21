@@ -29,6 +29,10 @@ fn main() -> anyhow::Result<()> {
     match std::env::args().nth(1).as_deref() {
         Some("--register") => return setup::register_mcp(),
         Some("--unregister") => return setup::unregister_mcp(),
+        Some("--version") | Some("-V") => {
+            println!("comfy-ui-mcp {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
         _ => {}
     }
     serve()
@@ -50,7 +54,11 @@ async fn serve() -> anyhow::Result<()> {
 
     let comfy_url =
         std::env::var("COMFYUI_URL").unwrap_or_else(|_| "http://127.0.0.1:8188".into());
-    info!(url = %comfy_url, "Starting comfy-ui-mcp server");
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        comfyui_url = %comfy_url,
+        "comfy-ui-mcp starting (stdio JSON-RPC; upstream ComfyUI at comfyui_url)"
+    );
 
     let client = ComfyClient::new(&comfy_url);
 
