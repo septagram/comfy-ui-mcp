@@ -62,6 +62,16 @@ async fn serve() -> anyhow::Result<()> {
 
     let client = ComfyClient::new(&comfy_url);
 
+    // Single writer task drains the channel and serializes all stdout writes.
+    // Multiple handler tasks can produce responses concurrently without
+    // interleaving bytes into the JSON-RPC stream.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<JsonRpcResponse>();
+    let writer = tokio::spawn(async move {
+        while let Some(resp) = rx.recv().await {
+            send_response(&resp);
+        }
+    });
+
     let stdin = tokio::io::stdin();
     let reader = BufReader::new(stdin);
     let mut lines = reader.lines();
@@ -78,18 +88,28 @@ async fn serve() -> anyhow::Result<()> {
             Ok(r) => r,
             Err(e) => {
                 let resp = JsonRpcResponse::error(None, -32700, format!("Parse error: {e}"));
-                send_response(&resp);
+                let _ = tx.send(resp);
                 continue;
             }
         };
 
-        let response = handle_request(&client, &request).await;
-        if let Some(resp) = response {
-            send_response(&resp);
-        }
+        // Spawn the handler so a long-running tool call (e.g. a multi-minute
+        // generation) doesn't block the stdin read loop. Without this, the
+        // host can time out and close our stdio, killing the process.
+        let client = client.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            if let Some(resp) = handle_request(&client, &request).await {
+                let _ = tx.send(resp);
+            }
+        });
     }
 
     info!("stdin closed, shutting down");
+    // Drop the original sender so the writer task can drain remaining
+    // responses from still-running handlers and then exit cleanly.
+    drop(tx);
+    let _ = writer.await;
     Ok(())
 }
 
@@ -184,9 +204,23 @@ async fn handle_request(client: &ComfyClient, req: &JsonRpcRequest) -> Option<Js
 }
 
 fn send_response(resp: &JsonRpcResponse) {
-    let json = serde_json::to_string(resp).expect("Failed to serialize response");
+    let json = match serde_json::to_string(resp) {
+        Ok(s) => s,
+        Err(e) => {
+            error!(error = %e, "Failed to serialize response");
+            return;
+        }
+    };
     let mut stdout = std::io::stdout().lock();
-    writeln!(stdout, "{json}").expect("Failed to write to stdout");
-    stdout.flush().expect("Failed to flush stdout");
+    if let Err(e) = writeln!(stdout, "{json}") {
+        // Broken pipe (host closed our stdio) or similar. Drop the response
+        // rather than panicking — we'll exit naturally on the next stdin read.
+        error!(error = %e, "Failed to write to stdout");
+        return;
+    }
+    if let Err(e) = stdout.flush() {
+        error!(error = %e, "Failed to flush stdout");
+        return;
+    }
     debug!(json = %json, "Sent");
 }

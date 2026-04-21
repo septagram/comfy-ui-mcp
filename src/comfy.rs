@@ -22,6 +22,7 @@ const MODEL_FOLDERS: &[&str] = &[
 /// Folders allowed as the prefix in a model specifier for generate_image.
 const ALLOWED_MODEL_FOLDERS: &[&str] = &["checkpoints", "unet_gguf", "diffusion_models"];
 
+#[derive(Clone)]
 pub struct ComfyClient {
     client: Client,
     base_url: String,
@@ -29,8 +30,15 @@ pub struct ComfyClient {
 
 impl ComfyClient {
     pub fn new(base_url: &str) -> Self {
+        // Per-request timeouts so a hung/restarting ComfyUI can't block reqwest
+        // indefinitely. Generous enough for normal multi-MB image fetches.
+        let client = Client::builder()
+            .timeout(Duration::from_secs(60))
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .unwrap_or_else(|_| Client::new());
         Self {
-            client: Client::new(),
+            client,
             base_url: base_url.trim_end_matches('/').to_string(),
         }
     }
