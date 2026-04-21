@@ -15,6 +15,25 @@ use crate::comfy::{
 use crate::mcp::{CallToolResult, ContentItem, ToolDefinition};
 use crate::metadata::read_image_metadata;
 
+/// Wire-format representation of a single LoRA entry in the `loras` array.
+/// `strength` drives the UNet contribution; `strength_clip` defaults to
+/// `strength` when absent (handler resolves via `to_lora_spec`).
+#[derive(Debug, Deserialize)]
+struct LoraEntry {
+    name: String,
+    #[serde(default = "default_lora_strength")]
+    strength: f64,
+    strength_clip: Option<f64>,
+}
+
+fn to_lora_spec(e: &LoraEntry) -> LoraSpec {
+    LoraSpec {
+        name: e.name.clone(),
+        strength: e.strength,
+        strength_clip: e.strength_clip.unwrap_or(e.strength),
+    }
+}
+
 /// Return the list of tool definitions with JSON Schemas.
 pub fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
@@ -37,14 +56,18 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         "type": "string",
                         "description": "Model to use, as shown by list_models (e.g. 'checkpoints/sd_xl_base_1.0.safetensors' or 'unet_gguf/flux1-schnell-Q8_0.gguf'). Plain filename assumes checkpoints/. Use list_models to see available models."
                     },
-                    "lora": {
-                        "type": "string",
-                        "description": "Optional LoRA to apply (e.g. 'LogoRedmondV2-Logo-LogoRedmAF.safetensors'). Just the filename, no folder prefix needed."
-                    },
-                    "lora_strength": {
-                        "type": "number",
-                        "description": "LoRA strength (0.0-1.0)",
-                        "default": 0.8
+                    "loras": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string", "description": "LoRA filename as shown by list_models, e.g. 'FLUX-dev-lora-Logo-Design.safetensors'." },
+                                "strength": { "type": "number", "default": 0.8, "description": "UNet weight (strength_model in ComfyUI terms). Controls visual style/structure contribution. Typical range 0.5–1.0." },
+                                "strength_clip": { "type": "number", "description": "CLIP text-encoder weight. Defaults to `strength`. Only set this when stacking multiple LoRAs and prompt adherence degrades — see tool-level description for why." }
+                            },
+                            "required": ["name"]
+                        },
+                        "description": "Optional. Omit or pass [] for no LoRA. LoRAs to apply, stacked in order (each one layers on top of the previous). For a SINGLE LoRA leave `strength_clip` unset — it defaults to `strength` and the UNet+CLIP halves of the LoRA were trained together at matching weights so they compose cleanly. When STACKING TWO OR MORE LoRAs, consider setting secondary LoRAs' `strength_clip` lower (often 0.0–0.3) — two LoRAs both steering the CLIP text encoder at full weight causes 'CLIP conflict': prompt understanding gets muddled, visual style still stacks. Rule of thumb: one 'lead' LoRA keeps CLIP at full strength; supporting LoRAs get CLIP weight dialed down so they contribute visually without hijacking the text encoder."
                     },
                     "width": {
                         "type": "integer",
@@ -125,14 +148,18 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         "type": "string",
                         "description": "FLUX-inpaint model to use (e.g. 'diffusion_models/flux1-fill-dev-Q8_0.gguf'). Defaults to the first available fill model. Non-inpaint models are rejected."
                     },
-                    "lora": {
-                        "type": "string",
-                        "description": "Optional LoRA filename (applied on top of Fill-dev)."
-                    },
-                    "lora_strength": {
-                        "type": "number",
-                        "description": "LoRA strength (0.0-1.0).",
-                        "default": 0.8
+                    "loras": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string", "description": "LoRA filename as shown by list_models." },
+                                "strength": { "type": "number", "default": 0.8, "description": "UNet weight (strength_model in ComfyUI terms). Typical range 0.5–1.0." },
+                                "strength_clip": { "type": "number", "description": "CLIP text-encoder weight. Defaults to `strength`. Set lower when stacking to avoid CLIP conflict." }
+                            },
+                            "required": ["name"]
+                        },
+                        "description": "Optional. Omit or pass [] for no LoRA. LoRAs to apply on top of Fill-dev, stacked in order. For a SINGLE LoRA leave `strength_clip` unset (defaults to `strength`). When STACKING TWO OR MORE LoRAs, set secondary LoRAs' `strength_clip` lower (often 0.0–0.3) to avoid CLIP conflict muddling prompt adherence — UNet contributions still stack visually, but both LoRAs fighting the CLIP text encoder at full weight degrades how the prompt is interpreted. Rule of thumb: one 'lead' LoRA at full CLIP strength, supporting LoRAs with CLIP dialed down."
                     },
                     "steps": {
                         "type": "integer",
@@ -282,9 +309,8 @@ struct GenerateImageArgs {
     model: Option<String>,
     // Backwards compat: accept "checkpoint" too
     checkpoint: Option<String>,
-    lora: Option<String>,
-    #[serde(default = "default_lora_strength")]
-    lora_strength: f64,
+    #[serde(default)]
+    loras: Vec<LoraEntry>,
     width: Option<u32>,
     height: Option<u32>,
     steps: Option<u32>,
@@ -386,17 +412,14 @@ async fn handle_generate_image(client: &ComfyClient, args: &Value) -> Result<Cal
     let cfg = if is_ip2p { def_cfg } else { args.cfg }; // IP2P models prefer their default cfg
     let seed = args.seed.unwrap_or_else(|| rand::random::<i64>().abs());
 
-    // LoRA spec
-    let lora_spec = args.lora.as_ref().map(|name| LoraSpec {
-        name: name.clone(),
-        strength: args.lora_strength,
-    });
+    // Resolve LoRA chain (may be empty)
+    let lora_specs: Vec<LoraSpec> = args.loras.iter().map(to_lora_spec).collect();
 
     info!(
         prompt = %args.prompt,
         model = format!("{folder}/{filename}"),
         mode = if is_edit { "edit" } else { "generate" },
-        lora = args.lora.as_deref().unwrap_or("none"),
+        loras = lora_specs.len(),
         size = format!("{width}x{height}"),
         steps = steps,
         seed = seed,
@@ -430,16 +453,16 @@ async fn handle_generate_image(client: &ComfyClient, args: &Value) -> Result<Cal
             let uploaded_name = client.upload_image(source_path).await?;
             build_ip2p_workflow(
                 &filename, &uploaded_name, &args.prompt, &args.negative_prompt,
-                steps, cfg, &args.sampler, iter_seed, args.denoise, lora_spec.as_ref(),
+                steps, cfg, &args.sampler, iter_seed, args.denoise, &lora_specs,
             )
         } else if is_flux {
             build_flux_workflow(
-                &filename, &args.prompt, width, height, steps, iter_seed, lora_spec.as_ref(),
+                &filename, &args.prompt, width, height, steps, iter_seed, &lora_specs,
             )
         } else {
             build_checkpoint_workflow(
                 &filename, &args.prompt, &args.negative_prompt,
-                width, height, steps, args.cfg, &args.sampler, iter_seed, lora_spec.as_ref(),
+                width, height, steps, args.cfg, &args.sampler, iter_seed, &lora_specs,
             )
         };
 
@@ -472,7 +495,11 @@ async fn handle_generate_image(client: &ComfyClient, args: &Value) -> Result<Cal
             "index": i + 1,
             "model": format!("{folder}/{filename}"),
             "mode": if is_edit { "edit" } else { "generate" },
-            "lora": args.lora,
+            "loras": args.loras.iter().map(|l| serde_json::json!({
+                "name": l.name,
+                "strength": l.strength,
+                "strength_clip": l.strength_clip.unwrap_or(l.strength),
+            })).collect::<Vec<_>>(),
             "size": format!("{width}x{height}"),
         }));
 
@@ -540,9 +567,8 @@ struct InpaintImageArgs {
     mask: String,
     prompt: String,
     model: Option<String>,
-    lora: Option<String>,
-    #[serde(default = "default_lora_strength")]
-    lora_strength: f64,
+    #[serde(default)]
+    loras: Vec<LoraEntry>,
     #[serde(default = "default_inpaint_steps")]
     steps: u32,
     seed: Option<i64>,
@@ -585,10 +611,7 @@ async fn handle_inpaint_image(client: &ComfyClient, args: &Value) -> Result<Call
         );
     }
 
-    let lora_spec = args.lora.as_ref().map(|name| LoraSpec {
-        name: name.clone(),
-        strength: args.lora_strength,
-    });
+    let lora_specs: Vec<LoraSpec> = args.loras.iter().map(to_lora_spec).collect();
 
     let seed = args.seed.unwrap_or_else(|| rand::random::<i64>().abs());
     let count = args.count.max(1);
@@ -597,7 +620,7 @@ async fn handle_inpaint_image(client: &ComfyClient, args: &Value) -> Result<Call
     info!(
         prompt = %args.prompt,
         model = format!("{folder}/{filename}"),
-        lora = args.lora.as_deref().unwrap_or("none"),
+        loras = lora_specs.len(),
         steps = args.steps,
         seed = seed,
         count = count,
@@ -631,7 +654,7 @@ async fn handle_inpaint_image(client: &ComfyClient, args: &Value) -> Result<Call
             &args.prompt,
             args.steps,
             iter_seed,
-            lora_spec.as_ref(),
+            &lora_specs,
         );
 
         let prompt_id = client.submit_prompt(&workflow).await?;
@@ -660,7 +683,11 @@ async fn handle_inpaint_image(client: &ComfyClient, args: &Value) -> Result<Call
             "seed": iter_seed,
             "index": i + 1,
             "model": format!("{folder}/{filename}"),
-            "lora": args.lora,
+            "loras": args.loras.iter().map(|l| serde_json::json!({
+                "name": l.name,
+                "strength": l.strength,
+                "strength_clip": l.strength_clip.unwrap_or(l.strength),
+            })).collect::<Vec<_>>(),
         }));
 
         match args.return_image.as_str() {

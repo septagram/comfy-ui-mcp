@@ -254,7 +254,7 @@ pub fn build_checkpoint_workflow(
     cfg: f64,
     sampler: &str,
     seed: i64,
-    lora: Option<&LoraSpec>,
+    loras: &[LoraSpec],
 ) -> Value {
     let mut workflow = serde_json::json!({
         "1": {
@@ -287,23 +287,13 @@ pub fn build_checkpoint_workflow(
         }
     });
 
-    // Model/clip source node — either checkpoint directly or through LoRA
-    let (model_ref, clip_ref): (Value, Value) = match lora {
-        Some(lora) => {
-            workflow["10"] = serde_json::json!({
-                "class_type": "LoraLoader",
-                "inputs": {
-                    "model": ["1", 0],
-                    "clip": ["1", 1],
-                    "lora_name": lora.name,
-                    "strength_model": lora.strength,
-                    "strength_clip": lora.strength
-                }
-            });
-            (serde_json::json!(["10", 0]), serde_json::json!(["10", 1]))
-        }
-        None => (serde_json::json!(["1", 0]), serde_json::json!(["1", 1])),
-    };
+    // Model/clip source — checkpoint direct, optionally through N stacked LoRAs
+    let (model_ref, clip_ref) = apply_lora_chain(
+        &mut workflow,
+        loras,
+        serde_json::json!(["1", 0]),
+        serde_json::json!(["1", 1]),
+    );
 
     workflow["2"] = serde_json::json!({
         "class_type": "CLIPTextEncode",
@@ -346,7 +336,7 @@ pub fn build_flux_workflow(
     height: u32,
     steps: u32,
     seed: i64,
-    lora: Option<&LoraSpec>,
+    loras: &[LoraSpec],
 ) -> Value {
     let mut workflow = serde_json::json!({
         "1": {
@@ -387,23 +377,13 @@ pub fn build_flux_workflow(
         }
     });
 
-    // Model/clip source — optionally through LoRA
-    let (model_ref, clip_ref): (Value, Value) = match lora {
-        Some(lora) => {
-            workflow["10"] = serde_json::json!({
-                "class_type": "LoraLoader",
-                "inputs": {
-                    "model": ["1", 0],
-                    "clip": ["2", 0],
-                    "lora_name": lora.name,
-                    "strength_model": lora.strength,
-                    "strength_clip": lora.strength
-                }
-            });
-            (serde_json::json!(["10", 0]), serde_json::json!(["10", 1]))
-        }
-        None => (serde_json::json!(["1", 0]), serde_json::json!(["2", 0])),
-    };
+    // Model/clip source — optionally through N stacked LoRAs
+    let (model_ref, clip_ref) = apply_lora_chain(
+        &mut workflow,
+        loras,
+        serde_json::json!(["1", 0]),
+        serde_json::json!(["2", 0]),
+    );
 
     workflow["3"] = serde_json::json!({
         "class_type": "CLIPTextEncode",
@@ -475,7 +455,45 @@ pub fn build_flux_workflow(
 
 pub struct LoraSpec {
     pub name: String,
+    /// UNet weight (`strength_model` on ComfyUI's `LoraLoader`).
     pub strength: f64,
+    /// CLIP text-encoder weight. The handler resolves the default
+    /// (usually `strength`) before building the workflow.
+    pub strength_clip: f64,
+}
+
+/// Chain `LoraLoader` nodes into `workflow`, one per entry, and return the
+/// (model_ref, clip_ref) that downstream nodes (e.g. `CLIPTextEncode`,
+/// `BasicGuider`, `KSampler`) should feed from. Uses string node IDs
+/// `"lora_0"`, `"lora_1"`, … so the chain is self-labelling in PNG
+/// metadata dumps and can't collide with the numeric IDs used elsewhere.
+///
+/// When `loras` is empty the initial refs are returned unchanged — no
+/// nodes added.
+pub fn apply_lora_chain(
+    workflow: &mut Value,
+    loras: &[LoraSpec],
+    initial_model: Value,
+    initial_clip: Value,
+) -> (Value, Value) {
+    let mut model_ref = initial_model;
+    let mut clip_ref = initial_clip;
+    for (i, lora) in loras.iter().enumerate() {
+        let id = format!("lora_{i}");
+        workflow[&id] = serde_json::json!({
+            "class_type": "LoraLoader",
+            "inputs": {
+                "model": model_ref,
+                "clip": clip_ref,
+                "lora_name": lora.name,
+                "strength_model": lora.strength,
+                "strength_clip": lora.strength_clip,
+            }
+        });
+        model_ref = serde_json::json!([id, 0]);
+        clip_ref = serde_json::json!([id, 1]);
+    }
+    (model_ref, clip_ref)
 }
 
 /// Check if a model filename is an InstructPix2Pix-compatible editing model.
@@ -520,7 +538,7 @@ pub fn build_ip2p_workflow(
     sampler: &str,
     seed: i64,
     denoise: f64,
-    lora: Option<&LoraSpec>,
+    loras: &[LoraSpec],
 ) -> Value {
     let mut workflow = serde_json::json!({
         "1": {
@@ -551,31 +569,15 @@ pub fn build_ip2p_workflow(
         }
     });
 
-    // Model/clip source — optionally through LoRA
-    let (model_ref, clip_ref, vae_ref): (Value, Value, Value) = match lora {
-        Some(lora) => {
-            workflow["10"] = serde_json::json!({
-                "class_type": "LoraLoader",
-                "inputs": {
-                    "model": ["1", 0],
-                    "clip": ["1", 1],
-                    "lora_name": lora.name,
-                    "strength_model": lora.strength,
-                    "strength_clip": lora.strength
-                }
-            });
-            (
-                serde_json::json!(["10", 0]),
-                serde_json::json!(["10", 1]),
-                serde_json::json!(["1", 2]),
-            )
-        }
-        None => (
-            serde_json::json!(["1", 0]),
-            serde_json::json!(["1", 1]),
-            serde_json::json!(["1", 2]),
-        ),
-    };
+    // Model/clip source — optionally through N stacked LoRAs.
+    // VAE stays on the checkpoint loader — LoRAs don't affect it.
+    let (model_ref, clip_ref) = apply_lora_chain(
+        &mut workflow,
+        loras,
+        serde_json::json!(["1", 0]),
+        serde_json::json!(["1", 1]),
+    );
+    let vae_ref = serde_json::json!(["1", 2]);
 
     // CLIP encode the edit instruction
     workflow["2"] = serde_json::json!({
@@ -639,7 +641,7 @@ pub fn build_flux_inpaint_workflow(
     prompt: &str,
     steps: u32,
     seed: i64,
-    lora: Option<&LoraSpec>,
+    loras: &[LoraSpec],
 ) -> Value {
     let mut workflow = serde_json::json!({
         "1": {
@@ -678,23 +680,13 @@ pub fn build_flux_inpaint_workflow(
         }
     });
 
-    // Model/clip source — optionally through LoRA (same shape as build_flux_workflow)
-    let (model_ref, clip_ref): (Value, Value) = match lora {
-        Some(lora) => {
-            workflow["10"] = serde_json::json!({
-                "class_type": "LoraLoader",
-                "inputs": {
-                    "model": ["1", 0],
-                    "clip": ["2", 0],
-                    "lora_name": lora.name,
-                    "strength_model": lora.strength,
-                    "strength_clip": lora.strength
-                }
-            });
-            (serde_json::json!(["10", 0]), serde_json::json!(["10", 1]))
-        }
-        None => (serde_json::json!(["1", 0]), serde_json::json!(["2", 0])),
-    };
+    // Model/clip source — optionally through N stacked LoRAs
+    let (model_ref, clip_ref) = apply_lora_chain(
+        &mut workflow,
+        loras,
+        serde_json::json!(["1", 0]),
+        serde_json::json!(["2", 0]),
+    );
 
     // Positive + (empty) negative text conditioning
     workflow["3"] = serde_json::json!({
