@@ -1,3 +1,9 @@
+## 1.4.1
+
+- `comfy-ui-mcp --version` (and `-V`) now prints the binary name and version, then exits. Previously it fell through to the stdio loop and looked hung.
+- Startup log is less misleading: field renamed `url` → `comfyui_url` and the message now reads `comfy-ui-mcp starting (stdio JSON-RPC; upstream ComfyUI at comfyui_url)`. The old wording could be misread as "MCP is listening on a TCP port", but this project has no HTTP server — the URL is just the upstream ComfyUI we connect to as a client. Also logs the crate version at startup so you can tell which binary is running without invoking `--version`.
+- `.env` and `**/.env` now in `.gitignore` so stray credentials don't get accidentally staged.
+
 ## 1.4.0
 
 **Breaking**: `lora` + `lora_strength` fields are removed from `generate_image` and `inpaint_image`. Use the new `loras` array instead.
